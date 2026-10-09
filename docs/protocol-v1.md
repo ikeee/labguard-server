@@ -12,7 +12,7 @@
 ## 2. 策略信封格式
 
 ```
-LGSRV1|<seq>|<issuedAt>|<policyJson>|<signature>
+LGSRV1|<seq>|<issuedAt>|<paused>|<policyJson>|<signature>
 ```
 
 | 字段 | 类型 | 说明 |
@@ -20,16 +20,17 @@ LGSRV1|<seq>|<issuedAt>|<policyJson>|<signature>
 | 魔数 | `LGSRV1` | 版本标识；不认识的魔数整封拒绝 |
 | `seq` | uint64 | **单调递增**序列号，每次保存策略 +1；客户端拒绝 `seq <= 已应用最大 seq`（防回滚/重放） |
 | `issuedAt` | ISO-8601 UTC | 下发时间，仅用于展示与日志，**不参与到期判断**（客户端不依赖墙钟） |
+| `paused` | 0/1 | **全员暂停标志**：「全员暂停」= 以 `paused=1` 保存策略（seq+1），「全员恢复」= `paused=0`（seq+1）。学生机收到后进入与本地老师暂停等价的状态（策略停、进程守护照旧）。并入信封使其同样受签名与 seq 保护——**伪服务器无法伪造暂停指令** |
 | `policyJson` | JSON 字符串 | 与客户端 `GuardConfig` 序列化格式**完全一致**（schema 由客户端 `catalog.json` 承载） |
-| `signature` | base64 | RSA-SHA256（2048 位），对 `LGSRV1|seq|issuedAt|policyJson`（前三段拼接）签名；私钥仅存教师机（DPAPI + ACL），公钥随配对文件 pin 到学生机 |
+| `signature` | base64 | RSA-SHA256（2048 位），对 `LGSRV1|seq|issuedAt|paused|policyJson`（前四段拼接）签名；私钥仅存教师机（DPAPI + ACL），公钥随配对文件 pin 到学生机 |
 
 ## 3. HTTP API（教师机，默认 `http://+:8210/`）
 
 | 方法与路径 | 请求 | 响应 | 说明 |
 |---|---|---|---|
-| `GET /api/version` | — | `{"seq":123,"sha256":"…"}` | 轻量探测：客户端对比 seq/sha，无变化不拉全文 |
+| `GET /api/version` | — | `{"seq":123,"sha256":"…","paused":false}` | 轻量探测：客户端对比 seq/sha，无变化不拉全文；`paused` 供托盘/面板展示 |
 | `GET /api/policy` | — | `text/plain`：LGSRV1 信封全文 | 全量策略下发 |
-| `POST /api/checkin` | `{"machine":"PC-01","version":"0.10","seq":123}` | `{"ok":true}` | 心跳上报；服务端聚合出在线学生机列表（默认 60s 无心跳判离线） |
+| `POST /api/checkin` | `{"machine":"PC-01","version":"0.10","seq":123,"paused":false}` | `{"ok":true}` | 心跳上报；服务端聚合出在线学生机列表（默认 60s 无心跳判离线） |
 
 - 状态码：`200` 正常；`404` 路径不存在；`503` 服务端未就绪（未配置策略/密钥）。
 - 客户端请求超时 3 秒（网卡阻塞坑：轮询线程必须是后台线程 + 超时 + 代际号，禁止放 UI 线程）。
@@ -40,11 +41,19 @@ LGSRV1|<seq>|<issuedAt>|<policyJson>|<signature>
 ```
 [单机模式] --配对且 Server.Enabled--＞ [轮询中]
 [轮询中] --GET /api/version 成功且 seq 更新--＞ 拉全文 → 验签 → seq 递增？
-    ├─ 是：热重载（停表→重建 Guard→启表），更新本地缓存 server-policy.cache
+    ├─ 是：按暂停规则应用（见下），更新本地缓存 server-policy.cache
     └─ 否：拒绝 + 日志告警（伪服务器/篡改/回滚）
 [轮询中] --连续失败（默认 3 次）--＞ [回退单机]（沿用最后生效策略，日志留痕）
 [回退单机] --任一次探测成功--＞ 回到 [轮询中]
 ```
+
+### 暂停规则（与本地老师暂停的交互，2026-10-09 定稿）
+
+| 收到信封时学生机的状态 | 行为 |
+|---|---|
+| 正常运行 | 热重载策略（停表→重建 Guard→启表）+ 按信封 `paused` 置位（`1` = 进入服务器暂停态：策略停、进程守护照旧） |
+| **老师本地暂停中**（本机 paused.flag 有效） | **缓存 pending，不打扰**；老师 resume 后应用缓存的最新一份（已决：暂停优先） |
+| 服务器暂停态（信封 paused=1 已生效） | 照常热重载配置（未在执行、无打扰），恢复后即用最新 |
 
 - 策略优先级：**服务器信封（验签通过）＞ 本地 config.json**；服务器在线时本地设置面板只读提示「当前由服务器管控」。
 - `Server.Enabled = 关` 或未配对 → 完全等同 v0.07 单机版行为。
