@@ -1,0 +1,11 @@
+bin/
+obj/
+dist/
+*.user
+*.suo
+.vs/
+_ReSharper.*/
+*.pdb
+*.md5
+HANDOFF.md
+catalog-snapshot.sha256
