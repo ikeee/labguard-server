@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <RootNamespace>LabGuardServer</RootNamespace>
+    <AssemblyName>LabGuardServer</AssemblyName>
+    <Product>LabGuard 教师机服务端</Product>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\LabGuardServer.Core\LabGuardServer.Core.csproj" />
+  </ItemGroup>
+
+  <!-- 开关目录契约快照：随主程序拷到输出目录 assets\（漂移检查见 SelfTest [C]） -->
+  <ItemGroup>
+    <None Include="..\..\assets\catalog.json" Link="assets\catalog.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

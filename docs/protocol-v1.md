@@ -22,19 +22,36 @@ LGSRV1|<seq>|<issuedAt>|<paused>|<policyJson>|<signature>
 | `issuedAt` | ISO-8601 UTC | 下发时间，仅用于展示与日志，**不参与到期判断**（客户端不依赖墙钟） |
 | `paused` | 0/1 | **全员暂停标志**：「全员暂停」= 以 `paused=1` 保存策略（seq+1），「全员恢复」= `paused=0`（seq+1）。学生机收到后进入与本地老师暂停等价的状态（策略停、进程守护照旧）。并入信封使其同样受签名与 seq 保护——**伪服务器无法伪造暂停指令** |
 | `policyJson` | JSON 字符串 | 与客户端 `GuardConfig` 序列化格式**完全一致**（schema 由客户端 `catalog.json` 承载） |
-| `signature` | base64 | RSA-SHA256（2048 位），对 `LGSRV1|seq|issuedAt|paused|policyJson`（前四段拼接）签名；私钥仅存教师机（DPAPI + ACL），公钥随配对文件 pin 到学生机 |
+| `signature` | base64 | RSA-SHA256（2048 位，PKCS#1 v1.5），对前五段拼接 `LGSRV1|seq|issuedAt|paused|policyJson` 的 UTF-8 字节签名；私钥仅存教师机（DPAPI + ACL），公钥随配对文件 pin 到学生机 |
+
+### 2.1 服务端磁盘信封（policy.envelope）
+
+- 加载/重载磁盘信封：**先解析验签、成功才提交**。验签失败、或 `seq` 低于当前已生效 seq（**签名合法的旧信封也拒**，服务端同样防回滚）→ 拒绝加载并**保留内存中的现行信封**（服务不中断），日志记 `RELOAD-REJECTED`。
+- 落盘文件即下发内容：`GET /api/policy` 直接返回该文件原文。
+- 跨语言兼容性（M1 互测实证）：信封可被 Python + openssl 独立解析与验签，不依赖 .NET。
 
 ## 3. HTTP API（教师机，默认 `http://+:8210/`）
 
 | 方法与路径 | 请求 | 响应 | 说明 |
 |---|---|---|---|
-| `GET /api/version` | — | `{"seq":123,"sha256":"…","paused":false}` | 轻量探测：客户端对比 seq/sha，无变化不拉全文；`paused` 供托盘/面板展示 |
-| `GET /api/policy` | — | `text/plain`：LGSRV1 信封全文 | 全量策略下发 |
+| `GET /api/version` | — | `{"seq":123,"sha256":"…","paused":false}` | 轻量探测：客户端对比 seq/sha，无变化不拉全文；`paused` 供托盘/面板展示。`sha256` = **信封全文的 SHA-256**，客户端可直接用作完整性 pin |
+| `GET /api/policy` | — | `text/plain; charset=utf-8`：LGSRV1 信封全文 | 全量策略下发 |
 | `POST /api/checkin` | `{"machine":"PC-01","version":"0.10","seq":123,"paused":false}` | `{"ok":true}` | 心跳上报；服务端聚合出在线学生机列表（默认 60s 无心跳判离线） |
 
-- 状态码：`200` 正常；`404` 路径不存在；`503` 服务端未就绪（未配置策略/密钥）。
+- 状态码：`200` 正常；`400` 请求非法（坏 JSON / 字段类型错乱 / 缺 machine）；`404` 路径不存在；`408` 请求体超时（发了 Content-Length 不发 body 的慢客户端，5 秒断开）；`413` 请求体超限（>8KB，Content-Length 先验即拒、不读流）；`429` 限速；`503` 服务端未就绪（未配置策略/密钥）。
 - 客户端请求超时 3 秒（网卡阻塞坑：轮询线程必须是后台线程 + 超时 + 代际号，禁止放 UI 线程）。
-- 服务端对 `/api/checkin` 做简单限速（同 IP 每秒 ≤2 次），防伪造心跳淹没。
+- 服务端对 `/api/checkin` 限速（**同 IP 每秒 ≤5 次**；每台学生机独立 IP、每 60s 一次心跳，正常部署不受影响。限速表 >1024 条目时清理 60 秒无活动的 IP，防洪泛换 IP 撑爆内存）。
+- **HEAD 与 GET 等价**（不写 body）：监控探活可直接 `HEAD /api/version`。
+- 每连接由线程池独立处理：单个慢客户端不阻塞其他请求（M1 红队测试修复）。
+
+### checkin 字段校验（M1 定稿）
+
+| 字段 | 必填 | 合法类型 | 违规响应 |
+|---|---|---|---|
+| `machine` | 是 | 字符串，1~256 字符 | `400 missing or invalid machine` |
+| `version` | 否 | 字符串 ≤32 字符；**给了但类型不对 → 400**（不悄悄吞） | `400 invalid version` |
+| `seq` | 否 | 整数（≥0）；字符串/负数/溢出一律拒绝 | `400 invalid seq` |
+| `paused` | 否 | 布尔 | 忽略其他类型 |
 
 ## 4. 客户端行为状态机
 
