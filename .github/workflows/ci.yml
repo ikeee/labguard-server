@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  build-and-selftest:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      # 敏感文件检查（执行计划 §A3）：密钥、口令、配对文件、策略信封、日志、产物一律不得入库
+      - name: 敏感文件检查
+        shell: pwsh
+        run: |
+          $bad = git ls-files | Where-Object { $_ -match '(?i)(^|/)(server-key\.bin|server-password\.txt|.*pairing.*\.json)$|\.envelope$|\.pfx$|\.snk$|^dist/|^release/' }
+          if ($bad) {
+            Write-Host "禁止提交的文件被 Git 跟踪："
+            $bad | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
+          Write-Host "敏感文件检查通过"
+
+      - name: 构建 + 自检（一条命令）
+        shell: pwsh
+        run: ./build.ps1 -Configuration Release
+
+      # 协议端到端冒烟：起 headless 服务端，用独立实现核对 15 项契约
+      - name: 协议端到端冒烟
+        shell: pwsh
+        run: ./scripts/e2e-headless.ps1 -Port 8211 -Seconds 15 -SkipBuild
