@@ -274,6 +274,9 @@ namespace LabGuardServer.Core.Api
                 else if (s is long l) { if (l < 0) return new ApiReply { Status = 400, ContentType = "text/plain", Body = "invalid seq" }; seq = (ulong)l; }
                 else if (s is int i) { if (i < 0) return new ApiReply { Status = 400, ContentType = "text/plain", Body = "invalid seq" }; seq = (uint)i; }
                 else if (s is double db && db == Math.Floor(db) && db >= 0 && db <= ulong.MaxValue) seq = Convert.ToUInt64(db);
+                // JavaScriptSerializer 会把带小数点的字面量（如 12.0）解析成 decimal：
+                // 取值是整数就接受（兼容非 .NET 客户端/工具），有小数部分才拒绝
+                else if (s is decimal dm && dm >= 0 && dm == Math.Floor(dm) && dm <= ulong.MaxValue) seq = (ulong)dm;
                 else return new ApiReply { Status = 400, ContentType = "text/plain", Body = "invalid seq" };
             }
 
