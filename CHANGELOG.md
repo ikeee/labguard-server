@@ -2,6 +2,22 @@
 
 ## v0.10（未发布 · 首版）
 
+- **LG-001 仓库基线审计**：新增 `docs/development-baseline.md`——项目职责 / 类依赖 /
+  启动到关闭的生命周期 / 策略编辑到客户端生效的数据流 / 持久化文件位置与权限与恢复语义 /
+  API 现状（方法·状态码·大小限制）/ **与《接手开发执行计划》的差距矩阵** /
+  技术债与发布阻塞项 / 永久禁止范围自查。
+  审计结论（要点）：发布阻塞项 = **R-1 URLACL 静默降级**（非管理员会静默退回回环，学生机连不上而托盘看似正常）、
+  R-2 无服务形态、R-3 无安装器/诊断包/部署指南、R-4 客户端接线未做、R-5 无 CI；
+  技术债 = **T-1 启动不校验 `seq` 下限**（违反安全不变量 8：签名合法的旧信封可让 seq 回退）、
+  T-2 信封落盘非原子、T-3 数据目录与口令文件未加固 ACL、T-4 日志无轮转、
+  T-5 `/api/version` 每请求一次 RSA 验签 + SHA-256、T-6 无稳定错误码、T-7 在线表只增不减。
+- **LG-002 一键构建与自检**：新增 `build.cmd` / `build.ps1`（`-Clean` → 构建 → 自检 →
+  产物落 `dist\labguard-server-v<版本>\`；退出码 `0` 成功 / `1` 构建失败 / `2` 自检失败 /
+  `3` 打包未实现 / `4` 前置条件不满足）；新增 `.github/workflows/ci.yml`
+  （敏感文件检查 + 构建 + 自检）；README 增加「构建与自检（开发）」章节。
+  `-Package` 在安装器实现前**明确非零退出**，不假装成功。
+- 执行计划正文收入仓库：`docs/development-plan.md`（与交付的原件逐字节同源，SHA256 已核对）。
+
 - 仓库初始化：README / LICENSE / CHANGELOG / 通信协议草案（`docs/protocol-v1.md`）。
 - **M1 服务端最小可用**：
   - `LabGuardServer.Core`：LGSRV1 信封组装/解析/验签（RSA-2048-SHA256，**显式 `RSACryptoServiceProvider(2048)`，net48 的 `RSA.Create().KeySize` 无效**）；DPAPI 加密密钥库 + ACL 加固；catalog.json 契约加载；PolicyStore（seq 单调 + 签名信封落盘/加载，**加载先验签后提交、支持 minSeq 防回滚、拒绝时保留内存现行信封**）；HttpListener API（version/policy/checkin，同 IP 限速 + 限速表防泄漏清理）；在线列表；口令散列（与客户端同算法）。
