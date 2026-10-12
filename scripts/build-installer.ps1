@@ -10,7 +10,7 @@
   退出码：0 成功 / 1 构建失败 / 2 打包后自检失败
 #>
 [CmdletBinding()]
-param([switch]$SkipBuild)
+param([switch]$SkipBuild, [switch]$AllowPublishedVersion)
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
@@ -20,6 +20,17 @@ $release = Join-Path $repo 'release'
 $props = Get-Content (Join-Path $repo 'Directory.Build.props') -Raw
 $version = [regex]::Match($props, '<Version>([^<]+)</Version>').Groups[1].Value.Trim()
 if (-not $version) { Write-Host '无法从 Directory.Build.props 取版本号' -ForegroundColor Red; exit 1 }
+
+# 版本闸门：**产物版本号必须新于已发布版本**（靠它分辨"这是哪次构建"，也防覆盖已发布资产）。
+# 每重打一次安装包就先把版本号 +1；确实要重打同一版本时加 -AllowPublishedVersion。
+try {
+    $existing = gh release view "v$version" --repo ikeee/labguard-server --json tagName --jq .tagName 2>$null
+    if ($existing) {
+        Write-Host ("版本闸门：v" + $version + " 已经发布过了！请先把 Directory.Build.props 的版本号 +1 再打包。") -ForegroundColor Red
+        Write-Host "（确实要重打同一版本：加 -AllowPublishedVersion）" -ForegroundColor Yellow
+        if (-not $AllowPublishedVersion) { exit 7 }
+    }
+} catch { }
 
 $sln = Join-Path $repo 'LabGuardServer.sln'
 $installerProj = Join-Path $repo 'src\LabGuardServer.Installer\LabGuardServer.Installer.csproj'

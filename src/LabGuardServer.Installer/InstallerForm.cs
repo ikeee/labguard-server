@@ -16,6 +16,7 @@ namespace LabGuardServer.Installer
 
         public InstallerForm()
         {
+            Icon = InstallerAppIcon.Get();
             Text = "LabGuard 教师机服务端 安装程序";
             Font = new Font("微软雅黑", 9F);
             ClientSize = new Size(760, 520);

@@ -95,7 +95,7 @@ namespace LabGuardServer
 
             _tray = new NotifyIcon
             {
-                Icon = System.Drawing.SystemIcons.Shield,
+                Icon = AppIcon.Get(),      // 右下角托盘图标 = 作者头像 + 黑底（不是系统盾牌）
                 Text = "LabGuard Server（教师机服务端）",
                 ContextMenuStrip = menu,
                 Visible = true,

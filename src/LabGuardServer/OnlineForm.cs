@@ -14,6 +14,7 @@ namespace LabGuardServer
         public OnlineForm(ServerTrayContext app)
         {
             _app = app;
+            Icon = AppIcon.Get();
             Text = "LabGuard Server · 在线学生机";
             StartPosition = FormStartPosition.CenterScreen;
             ClientSize = new System.Drawing.Size(640, 420);

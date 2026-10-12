@@ -27,6 +27,8 @@
     <EmbeddedResource Include="payload\LabGuardServer.exe.config" LogicalName="payload/LabGuardServer.exe.config" Condition="Exists('payload\LabGuardServer.exe.config')" />
     <EmbeddedResource Include="payload\LabGuardServer.Core.dll" LogicalName="payload/LabGuardServer.Core.dll" Condition="Exists('payload\LabGuardServer.Core.dll')" />
     <EmbeddedResource Include="payload\assets\catalog.json" LogicalName="payload/assets/catalog.json" Condition="Exists('payload\assets\catalog.json')" />
+    <!-- 窗体图标用（文件图标由 ApplicationIcon 提供） -->
+    <EmbeddedResource Include="..\LabGuardServer\Assets\app.ico" LogicalName="payload.app.ico" />
   </ItemGroup>
 
 </Project>
