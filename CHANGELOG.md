@@ -2,6 +2,19 @@
 
 ## v0.10（未发布 · 首版）
 
+- **无界面模式（headless CLI）**：`LabGuardServer.exe --headless --data-dir <目录> [--port N] [--bind-all]
+  [--password <口令>] [--policy-default | --set-policy <策略.json>] [--export-pairing <文件>] [--seconds N]`。
+  动机：托盘 UI 里"设密码 → 保存策略 → 导出配对文件"全靠人点，导致端到端验收（LG-007）与
+  100/200 客户端压力测试（LG-011）无法自动化。**不新增任何协议能力**，只换一个人机接口。
+- **协议端到端冒烟脚本** `scripts/e2e-headless.ps1`：起 headless 服务端后用**独立实现**
+  （PowerShell + .NET，不复用 C# 实现）核对 15 项契约——`/api/version` 的 `sha256` 是否等于信封全文
+  SHA-256、配对文件指纹是否等于公钥 XML 的 SHA-256 前 8 字节、配对文件不含私钥、
+  `/api/policy` 以 `LGSRV1|` 开头、checkin 正常 200 / 坏 JSON 400 / 超大 413、HEAD 200、未知路径 404、
+  在线列表聚合、到点正常收尾。一条命令 15/15 通过（退出码 0）。
+- 修复：无控制台句柄（WinExe 被 `Start-Process` 隐藏启动 / 输出重定向）时 `Console.OutputEncoding`
+  会抛 `IOException`，且中文按 ANSI(GBK) 落进重定向文件导致自动化脚本读成乱码 ——
+  现改为"能设就设，不能设就用显式 UTF-8 写出器"。
+
 - **LG-003 协议实现逐项对照审计**：新增 `docs/protocol-conformance.md`——
   端点与行为 / 限制与防护 / checkin schema / 信封与签名 / seq 与防回滚 / 持久化与恢复 六张对照表，
   每条给出实现位置、测试编号与结论（`符合` / `文档已补` / `实现已修` / `待办`），

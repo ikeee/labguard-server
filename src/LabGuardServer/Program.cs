@@ -35,6 +35,13 @@ namespace LabGuardServer
             int di = Array.IndexOf(args ?? new string[0], "--data-dir");
             if (di >= 0 && args.Length > di + 1) DataDir = args[di + 1];
 
+            // 无界面模式（自动化测试 / 无人值守部署）：不创建托盘与窗口
+            if (ServerCli.WantsCli(args))
+            {
+                Environment.ExitCode = ServerCli.Run(args, DataDir);
+                return;
+            }
+
             // 单实例
             bool createdNew;
             using (var mutex = new Mutex(true, "LabGuardServer_SingleInstance", out createdNew))

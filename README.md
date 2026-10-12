@@ -44,6 +44,25 @@ build.cmd
 前置：.NET SDK 8（`net48` 目标由 `Microsoft.NETFramework.ReferenceAssemblies` 提供，
 无需 VS Build Tools）；CI 见 `.github/workflows/ci.yml`。
 
+### 无界面模式（自动化验收 / 无人值守）
+
+```bat
+LabGuardServer.exe --headless --data-dir D:\lg-test --port 8210 ^
+    --password <管理口令> --policy-default ^
+    --export-pairing D:\lg-test\pairing.json --seconds 60
+```
+
+`--policy-default`（用开关目录默认策略）或 `--set-policy <策略.json>` 保存一次策略；
+`--export-pairing <文件>` 导出配对文件（给了它且没给 `--headless` 就只导出后退出）；
+`--seconds N` 跑够 N 秒自动退出（测试用），省略则一直跑到 Ctrl+C。
+省略 `--bind-all` 时只监听 127.0.0.1（不需要 URLACL）。
+
+协议端到端冒烟（会自己起服务端、用**独立实现**核对 15 项契约、检查完自动收尾）：
+
+```bat
+powershell -File scripts\e2e-headless.ps1 -Port 8211 -Seconds 20
+```
+
 ## 部署（v0.10 发布后）
 
 在**教师机**（非学生机）运行 `LabGuardServer-Setup-v0.10.exe`，安装向导会：生成签名密钥对 → 导出「配对文件」→ U 盘/共享拷到学生机执行客户端安装脚本的 `-Pair` 参数完成配对。详见届时发布的部署指南。
