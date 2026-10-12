@@ -220,6 +220,19 @@ namespace LabGuardServer.SelfTest
                 Check(ApiServer.Checkin("{\"machine\":\"PC\"}", "192.168.1.21", online, rateMap, now).Status == 200,
                     "5.13 缺 version/seq 仍 200（协议允许的可选字段，纯心跳）");
 
+                // LG-003 协议对照补测：每条都写进 docs/protocol-conformance.md
+                Check(ApiServer.Checkin("", "192.168.1.22", online, rateMap, now).Status == 400,
+                    "5.14 空请求体 → 400");
+                Check(ApiServer.Checkin("{\"machine\":\"PC-OK\",\"unknownField\":{\"a\":1}}", "192.168.1.23",
+                        online, rateMap, now).Status == 200,
+                    "5.15 未知字段被忽略（向前兼容）");
+                Check(ApiServer.Checkin("{\"machine\":\"PC-D\",\"seq\":12.0}", "192.168.1.24",
+                        online, rateMap, now).Status == 200,
+                    "5.16 seq 为整数值的数字（12.0）→ 接受");
+                Check(ApiServer.Checkin("{\"machine\":\"PC-F\",\"seq\":12.5}", "192.168.1.25",
+                        online, rateMap, now).Status == 400,
+                    "5.17 seq 有小数部分（12.5）→ 400");
+
                 // 负超时 = 任何记录都判离线（确定性；正零会有同 tick 差值为 0 的分辨率问题）
                 online.OfflineAfter = TimeSpan.FromSeconds(-5);
                 Check(online.Snapshot().Length == 0, "5.8 超时判离线");
@@ -261,6 +274,21 @@ namespace LabGuardServer.SelfTest
                             catch (WebException ex) when ((ex.Response as HttpWebResponse)?.StatusCode == HttpStatusCode.NotFound)
                             {
                                 Check(true, "6.6 未知路径 404");
+                            }
+
+                            // LG-003：未定义的方法一律 404（PUT 不是 checkin 的合法方法）
+                            var put = (HttpWebRequest)WebRequest.Create("http://127.0.0.1:" + port + "/api/checkin");
+                            put.Method = "PUT";
+                            put.ContentLength = 0;
+                            put.Timeout = 5000;
+                            try
+                            {
+                                put.GetResponse();
+                                Check(false, "6.12 PUT /api/checkin → 404（未定义方法）");
+                            }
+                            catch (WebException ex) when ((ex.Response as HttpWebResponse)?.StatusCode == HttpStatusCode.NotFound)
+                            {
+                                Check(true, "6.12 PUT /api/checkin → 404（未定义方法）");
                             }
                         }
 
@@ -329,6 +357,57 @@ namespace LabGuardServer.SelfTest
                 Check(PasswordHasher.Validate("123456") != null && PasswordHasher.Validate("a1b2c3") == null,
                     "7.3 弱口令检出 / 正常口令放行");
                 Check(!PasswordHasher.Verify("a1b2c3", "not-a-hash"), "7.4 散列格式损坏安全拒绝");
+
+                // ================================================================ [8] seq 水位与重启防回退
+                // 执行计划 §B2 不变量 8：服务重启后不得把 seq 回退到旧值。
+                // 只在磁盘信封上做验签是查不出"签名合法的旧信封被放回磁盘"的，必须靠 seq 水位。
+                Console.WriteLine("[8] seq 水位与重启防回退（安全不变量 8）");
+                var wmPolicy = catalog != null
+                    ? Json.ParseObject(catalog.DefaultPolicyJson)
+                    : new Dictionary<string, object>();
+                string envelopePath = null;
+                string wmDir = Path.Combine(tmp, "watermark");
+                var wmStore = new PolicyStore(wmDir, keys);
+                wmStore.Load();
+                Check(wmStore.Watermark == 0, "8.1 首次启动：水位为 0");
+                wmStore.Save(wmPolicy, false, catalog?.DefaultPolicyJson);
+                Check(wmStore.CurrentSeq == 1 && wmStore.Watermark == 1, "8.2 保存后水位跟随 seq=1");
+                envelopePath = Path.Combine(wmDir, "policy.envelope");
+                string firstEnvelope = File.ReadAllText(envelopePath, Encoding.UTF8);
+                wmStore.Save(wmPolicy, false, catalog?.DefaultPolicyJson);       // seq=2
+                Check(wmStore.CurrentSeq == 2 && wmStore.Watermark == 2, "8.3 再保存 seq=2、水位=2");
+
+                // 攻击场景：把磁盘信封换成**签名合法**的旧信封（seq=1），然后"重启"
+                File.WriteAllText(envelopePath, firstEnvelope, new UTF8Encoding(false));
+                bool wmRollbackCaught = false;
+                try { new PolicyStore(wmDir, keys).Load(); }                    // 故意不传 minSeq
+                catch (InvalidDataException) { wmRollbackCaught = true; }
+                Check(wmRollbackCaught, "8.4 重启加载：签名合法的旧信封被水位拦下（不传 minSeq 也拒）");
+
+                // 水位文件损坏 → 告警降级（按 0），但不能阻断启动
+                File.WriteAllText(Path.Combine(wmDir, "seq.highwater"), "{坏", new UTF8Encoding(false));
+                var degraded = new PolicyStore(wmDir, keys);
+                bool degradedOk = true;
+                try { degraded.Load(); } catch { degradedOk = false; }
+                Check(degradedOk && degraded.CurrentSeq == 1,
+                    "8.5 水位文件损坏 → 告警按 0 处理，不阻断加载");
+
+                // 只有水位、没有信封（换机/清空策略文件）：保存必须从水位继续，不复用已发布过的 seq
+                string wmDir2 = Path.Combine(tmp, "watermark2");
+                Directory.CreateDirectory(wmDir2);
+                File.WriteAllText(Path.Combine(wmDir2, "seq.highwater"),
+                    "{\"schemaVersion\":1,\"seq\":5}", new UTF8Encoding(false));
+                var wmStore2 = new PolicyStore(wmDir2, keys);
+                wmStore2.Load();
+                Check(wmStore2.CurrentEnvelope == null && wmStore2.Watermark == 5,
+                    "8.6 只有水位没有信封：水位仍然生效");
+                wmStore2.Save(wmPolicy, false, catalog?.DefaultPolicyJson);
+                Check(wmStore2.CurrentSeq == 6, "8.7 保存从水位继续（seq=6），不复用已发布过的 seq");
+
+                // 原子写（§B4）：不留 .tmp 残留
+                Check(!File.Exists(Path.Combine(wmDir2, "policy.envelope.tmp")) &&
+                      !File.Exists(Path.Combine(wmDir2, "seq.highwater.tmp")),
+                    "8.8 安全写入不留 .tmp 残留");
             }
         }
 

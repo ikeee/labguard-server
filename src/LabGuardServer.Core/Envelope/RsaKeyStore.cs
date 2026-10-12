@@ -54,7 +54,8 @@ namespace LabGuardServer.Core.Envelope
                 // 必须 new RSACryptoServiceProvider(2048) 显式指定位长
                 rsa = new RSACryptoServiceProvider(2048);
                 byte[] xmlBytes = Encoding.UTF8.GetBytes(rsa.ToXmlString(true));
-                File.WriteAllBytes(path, ProtectedData.Protect(xmlBytes, null, DataProtectionScope.LocalMachine));
+                // 安全写入（§B4）：私钥文件绝不能被写成"半截"——写完再原子替换，避免断电半写
+                Util.AtomicFile.WriteAllBytes(path, ProtectedData.Protect(xmlBytes, null, DataProtectionScope.LocalMachine));
                 TryHardenFile(path);
             }
             if (rsa.KeySize < 2048)

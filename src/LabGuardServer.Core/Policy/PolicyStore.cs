@@ -4,6 +4,7 @@ using System.IO;
 using System.Security.Cryptography;
 using System.Text;
 using LabGuardServer.Core.Envelope;
+using LabGuardServer.Core.Logging;
 using LabGuardServer.Core.Util;
 
 namespace LabGuardServer.Core.Policy
@@ -24,10 +25,19 @@ namespace LabGuardServer.Core.Policy
     public sealed class PolicyStore
     {
         private const string PolicyFileName = "policy.envelope";
+        private const string WatermarkFileName = "seq.highwater";
 
         public string DataDir { get; }
         private string PolicyPath => Path.Combine(DataDir, PolicyFileName);
+        private string WatermarkPath => Path.Combine(DataDir, WatermarkFileName);
         private readonly RsaKeyStore _keys;
+
+        /// <summary>
+        /// 已发布过的**最大 seq**（水位）。它是防"重启后 seq 回退"的关键：
+        /// 磁盘信封被换成一份**签名合法的旧信封**时，光靠验签是查不出来的，
+        /// 必须拿水位比对（执行计划 §B2 不变量 8）。
+        /// </summary>
+        public ulong Watermark { get; private set; }
 
         public PolicyStore(string dataDir, RsaKeyStore keys)
         {
@@ -48,6 +58,7 @@ namespace LabGuardServer.Core.Policy
         /// </summary>
         public void Load(ulong? minSeq = null)
         {
+            Watermark = LoadWatermark();     // 先读水位：它比磁盘信封更可信（信封可被人换成旧的一份）
             if (!File.Exists(PolicyPath))
             {
                 CurrentEnvelope = null;
@@ -58,11 +69,13 @@ namespace LabGuardServer.Core.Policy
             EnvelopeData d = PolicyEnvelope.Parse(raw, _keys.Rsa);
             if (!d.Verified)
                 throw new InvalidDataException("策略信封验签失败（policy.envelope 疑似被篡改）——拒绝加载，请人工检查 " + PolicyPath);
-            if (minSeq.HasValue && d.Seq < minSeq.Value)
-                throw new InvalidDataException("拒绝回滚：磁盘信封 seq=" + d.Seq + " 低于当前 seq=" + minSeq.Value +
-                    "（签名虽合法但为旧版本信封）");
+            ulong floor = Math.Max(minSeq ?? 0, Watermark);
+            if (floor > 0 && d.Seq < floor)
+                throw new InvalidDataException("拒绝回滚：磁盘信封 seq=" + d.Seq + " 低于已发布水位/下限 " + floor +
+                    "（签名虽合法，但它是旧版本信封——放行会让 seq 回退）");
             CurrentEnvelope = raw;
             CurrentSeq = d.Seq;
+            SaveWatermark(Math.Max(Watermark, d.Seq));
         }
 
         /// <summary>
@@ -83,11 +96,12 @@ namespace LabGuardServer.Core.Policy
                     throw new ArgumentNullException(nameof(defaultPolicyJsonForReset));
                 json = defaultPolicyJsonForReset;
             }
-            ulong seq = CurrentSeq + 1;
+            ulong seq = Math.Max(CurrentSeq, Watermark) + 1;   // 永不重复使用已发布过的 seq
             string envelope = PolicyEnvelope.Build(seq, DateTime.UtcNow, paused, json, _keys.Rsa);
-            File.WriteAllText(PolicyPath, envelope, new UTF8Encoding(false));
+            AtomicFile.WriteAllText(PolicyPath, envelope);
             CurrentEnvelope = envelope;
             CurrentSeq = seq;
+            SaveWatermark(seq);
             return Version();
         }
 
@@ -126,6 +140,49 @@ namespace LabGuardServer.Core.Policy
                 if (d.Verified) return Json.ParseObject(d.PolicyJson);
             }
             return Json.ParseObject(catalog.DefaultPolicyJson);
+        }
+
+        // ------------------------------------------------------------------ seq 水位
+
+        /// <summary>
+        /// 读水位（<c>seq.highwater</c>，格式 <c>{"schemaVersion":1,"seq":N}</c>）。
+        /// 缺失 / 损坏 / schemaVersion 不认识 → 按 0 处理并告警（不抛异常：降级为"无回退保护"，
+        /// 也不影响本次启动——但下次 Save 一定基于内存里的 CurrentSeq，不会倒着走）。
+        /// </summary>
+        private ulong LoadWatermark()
+        {
+            try
+            {
+                if (!File.Exists(WatermarkPath)) return 0;
+                Dictionary<string, object> doc = Json.ParseObject(File.ReadAllText(WatermarkPath, Encoding.UTF8));
+                if (doc == null) throw new InvalidDataException("水位文件不是 JSON 对象");
+                int schema = doc.TryGetValue("schemaVersion", out object s) && s is IConvertible
+                    ? Convert.ToInt32(s) : 0;
+                if (schema != 1) throw new InvalidDataException("水位文件 schemaVersion 不认识：" + schema);
+                if (!doc.TryGetValue("seq", out object v) || v == null)
+                    throw new InvalidDataException("水位文件缺少 seq");
+                return Convert.ToUInt64(v);
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("seq 水位文件不可用，按 0 处理（重启防回退保护降级）：" + ex.Message);
+                return 0;
+            }
+        }
+
+        private void SaveWatermark(ulong seq)
+        {
+            if (seq <= Watermark) return;
+            try
+            {
+                AtomicFile.WriteAllText(WatermarkPath,
+                    "{\"schemaVersion\":1,\"seq\":" + seq.ToString(System.Globalization.CultureInfo.InvariantCulture) + "}");
+                Watermark = seq;
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("写 seq 水位失败（重启防回退保护降级）：" + ex.Message);
+            }
         }
     }
 }
