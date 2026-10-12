@@ -2,10 +2,12 @@
 
 **LabGuard 教师机服务端** —— 在教师机上统一编辑机房管控策略、一键下发给全部学生机，学生机收到即生效。
 
-**状态：🚧 建设中（v0.10 开发阶段，尚未发布可用版本）**
+**状态：✅ v0.10.0（教师机服务端 + 学生机客户端双仓，已可部署）**
 
 - 配套客户端（学生机端）：**[ikeee/labguard](https://github.com/ikeee/labguard)**（v0.07 为单机版最终版，v0.10 起支持本服务端）
+- **部署指南：[docs/deployment-guide.md](docs/deployment-guide.md)**（教师机 3 分钟 / 学生机 1 分钟，含无人值守与排障）
 - 许可：MIT（见 [LICENSE](LICENSE)）· 更新记录：[CHANGELOG.md](CHANGELOG.md) · 通信协议：[docs/protocol-v1.md](docs/protocol-v1.md)
+- 开发文档：[开发基线](docs/development-baseline.md) · [协议实现对照审计](docs/protocol-conformance.md) · [接手开发执行计划](docs/development-plan.md)
 
 ## 是什么
 
@@ -63,6 +65,8 @@ LabGuardServer.exe --headless --data-dir D:\lg-test --port 8210 ^
 powershell -File scripts\e2e-headless.ps1 -Port 8211 -Seconds 20
 ```
 
-## 部署（v0.10 发布后）
+## 部署
 
-在**教师机**（非学生机）运行 `LabGuardServer-Setup-v0.10.exe`，安装向导会：生成签名密钥对 → 导出「配对文件」→ U 盘/共享拷到学生机执行客户端安装脚本的 `-Pair` 参数完成配对。详见届时发布的部署指南。
+在**教师机**运行 `LabGuardServer-Setup-v0.10.0.exe`（一键完成：装文件 → 配 URLACL → 加防火墙规则 → 登录自启 → 启动并自检），
+然后在策略面板设置口令、保存并下发、导出「配对文件」；学生机用客户端安装包安装后导入配对文件即可。
+**完整步骤、无人值守命令与排障表见 [docs/deployment-guide.md](docs/deployment-guide.md)。**

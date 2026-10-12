@@ -1,6 +1,10 @@
 # 更新记录
 
-## v0.10（未发布 · 首版）
+## v0.10.0（2026-10-12 · 首版：教师机服务端 + 学生机客户端双仓）
+
+- **已可部署**：教师机 `LabGuardServer-Setup-v0.10.0.exe`（单文件安装器：URLACL + 防火墙 + 登录自启 + 自检），
+  学生机 `LabGuard-一键安装程序.exe`（支持 `--silent … --pair <配对文件>` 一条命令完成安装 + 配网信任）。
+  部署步骤见 `docs/deployment-guide.md`；真机端到端已验收（下发 → 验签 → 应用 → 回报 seq → 教师端可见）。
 
 - **无界面模式（headless CLI）**：`LabGuardServer.exe --headless --data-dir <目录> [--port N] [--bind-all]
   [--password <口令>] [--policy-default | --set-policy <策略.json>] [--export-pairing <文件>] [--seconds N]`。
