@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <RootNamespace>LabGuardServer.Installer</RootNamespace>
+    <AssemblyName>LabGuardServer.Installer</AssemblyName>
+    <Product>LabGuard 教师机服务端 安装程序</Product>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <!-- 快捷方式用 COM(WScript.Shell) 的 dynamic 调用，需要它 -->
+    <Reference Include="Microsoft.CSharp" />
+  </ItemGroup>
+
+  <!-- 服务端本体作为资源内嵌：安装器是**单文件 exe**（不依赖外部目录，U 盘/共享拷一个文件就能装） -->
+  <ItemGroup>
+    <EmbeddedResource Include="..\LabGuardServer\bin\$(Configuration)\net48\LabGuardServer.exe"
+                      LogicalName="payload/LabGuardServer.exe" Condition="Exists('..\LabGuardServer\bin\$(Configuration)\net48\LabGuardServer.exe')" />
+    <EmbeddedResource Include="..\LabGuardServer\bin\$(Configuration)\net48\LabGuardServer.exe.config"
+                      LogicalName="payload/LabGuardServer.exe.config" Condition="Exists('..\LabGuardServer\bin\$(Configuration)\net48\LabGuardServer.exe.config')" />
+    <EmbeddedResource Include="..\LabGuardServer.Core\bin\$(Configuration)\net48\LabGuardServer.Core.dll"
+                      LogicalName="payload/LabGuardServer.Core.dll" Condition="Exists('..\LabGuardServer.Core\bin\$(Configuration)\net48\LabGuardServer.Core.dll')" />
+    <EmbeddedResource Include="..\..\assets\catalog.json"
+                      LogicalName="payload/assets/catalog.json" />
+  </ItemGroup>
+
+</Project>
