@@ -378,6 +378,35 @@ namespace LabGuardServer.SelfTest
                 Check(PolicyDiff.Format(null) == "（空）" && PolicyDiff.Format(true) == "开" &&
                       PolicyDiff.Format(false) == "关", "7.11 空值/布尔格式化");
 
+                // ---- 职责归属（2026-10-12 定稿）：服务端不执行管控，只下发；面板按"谁执行"分三层
+                List<string> sections = catalog.Sections();
+                var unclassified = PolicyOwnership.UnclassifiedSections(sections);
+                Check(unclassified.Count == 0, "7.12 客户端目录里每个分组都被归属表覆盖",
+                    string.Join("；", unclassified));
+                var unmatched = PolicyOwnership.UnmatchedPrefixes(sections);
+                Check(unmatched.Count == 0, "7.13 归属表里每个前缀都能对上目录分组（改名不会静默失效）",
+                    string.Join("；", unmatched));
+                Check(PolicyOwnership.Of(sections.First(s => s.StartsWith("1、", StringComparison.Ordinal))) == PolicyTier.SelfProtect,
+                    "7.14 电子教室保护 → 学生端自保（学生机执行，不是教师端的活）");
+                Check(PolicyOwnership.Of(sections.First(s => s.StartsWith("14、", StringComparison.Ordinal))) == PolicyTier.SelfProtect,
+                    "7.15 进程防拆加固 → 学生端自保");
+                Check(PolicyOwnership.Of(sections.First(s => s.StartsWith("15、", StringComparison.Ordinal))) == PolicyTier.ServerLocal &&
+                      !PolicyOwnership.VisibleInPanel(sections.First(s => s.StartsWith("15、", StringComparison.Ordinal))),
+                    "7.16 服务器统一管控 → 教师端自身，面板不显示（学生机不收这组值）");
+                Check(PolicyOwnership.Of(sections.First(s => s.StartsWith("2、", StringComparison.Ordinal))) == PolicyTier.Classroom,
+                    "7.17 网络与防火墙 → 课堂管控（老师常改）");
+                Check(PolicyOwnership.SectionsOf(sections, PolicyTier.Classroom).Count >= 8 &&
+                      PolicyOwnership.SectionsOf(sections, PolicyTier.SelfProtect).Count >= 4,
+                    "7.18 两层分组数量合理（课堂 ≥8 / 自保 ≥4）");
+                Check(PolicyOwnership.TierTitle(PolicyTier.Classroom).Contains("课堂") &&
+                      PolicyOwnership.TierTitle(PolicyTier.SelfProtect).Contains("学生端") &&
+                      PolicyOwnership.TierHint(PolicyTier.SelfProtect).Contains("学生机"),
+                    "7.19 每层都有标题与说明（界面照着它讲「谁在干活」）");
+                Check(catalog.Fields.Count(f => PolicyOwnership.VisibleInPanel(f.Section)) ==
+                      catalog.Fields.Count - catalog.Fields.Count(f => PolicyOwnership.Of(f.Section) == PolicyTier.ServerLocal),
+                    "7.20 面板显示数 = 全部 − 教师端自身数",
+                    catalog.Fields.Count(f => PolicyOwnership.VisibleInPanel(f.Section)) + " / " + catalog.Fields.Count);
+
                 // ================================================================ [8] seq 水位与重启防回退
                 // 执行计划 §B2 不变量 8：服务重启后不得把 seq 回退到旧值。
                 // 只在磁盘信封上做验签是查不出"签名合法的旧信封被放回磁盘"的，必须靠 seq 水位。
