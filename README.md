@@ -29,6 +29,21 @@ LabGuard 是面向中小学计算机机房的**学生机管控程序**（客户�
 | v0.10 | 服务端最小可用：策略编辑 + 签名下发 + 在线学生机列表；客户端（labguard v0.10）接收即生效 |
 | v0.11+ | 候选：一键全员暂停/恢复、上课/下课场景、审计报表导出 |
 
+## 构建与自检（开发）
+
+新签出的仓库，一条命令完成 Release 构建 + 自检（不需要装 Visual Studio）：
+
+```bat
+build.cmd
+```
+
+等价于 `powershell -File build.ps1`（可加 `-Clean` / `-NoSelfTest` / `-Package`）。
+产物落在 `dist\labguard-server-v<版本>\`（`bin/`、`obj/`、`dist/` 均不进 Git）。
+退出码：`0` 成功 / `1` 构建失败 / `2` 自检失败 / `3` 打包未实现 / `4` 前置条件不满足。
+
+前置：.NET SDK 8（`net48` 目标由 `Microsoft.NETFramework.ReferenceAssemblies` 提供，
+无需 VS Build Tools）；CI 见 `.github/workflows/ci.yml`。
+
 ## 部署（v0.10 发布后）
 
 在**教师机**（非学生机）运行 `LabGuardServer-Setup-v0.10.exe`，安装向导会：生成签名密钥对 → 导出「配对文件」→ U 盘/共享拷到学生机执行客户端安装脚本的 `-Pair` 参数完成配对。详见届时发布的部署指南。
