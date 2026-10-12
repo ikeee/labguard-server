@@ -408,6 +408,37 @@ namespace LabGuardServer.SelfTest
                 Check(!File.Exists(Path.Combine(wmDir2, "policy.envelope.tmp")) &&
                       !File.Exists(Path.Combine(wmDir2, "seq.highwater.tmp")),
                     "8.8 安全写入不留 .tmp 残留");
+
+                // ================================================================ [9] 磁盘策略热拾取
+                // 服务端内存策略只在启动时读一次；外部（CLI/脚本/管理端）保存的策略必须能被运行中的实例拾取，
+                // 否则会出现"磁盘是新策略、/api/policy 还发旧信封"的静默不一致。口径与启动加载一致：先验签 + 比 seq。
+                Console.WriteLine("[9] 磁盘策略热拾取（外部保存 / 防回退 / 坏文件）");
+                string watchDir = Path.Combine(tmp, "watch");
+                var live = new PolicyStore(watchDir, keys);
+                live.Load();
+                live.StartWatching();
+                live.Save(catalog != null ? Json.ParseObject(catalog.DefaultPolicyJson) : new Dictionary<string, object>(),
+                    false, catalog?.DefaultPolicyJson);
+                Check(live.CurrentSeq == 1, "9.1 现行策略 seq=1（监视已开启）");
+
+                string envelopeSeq1 = live.CurrentEnvelope;
+                var writerStore = new PolicyStore(watchDir, keys);   // 模拟"另一个进程"保存
+                writerStore.Load();
+                writerStore.Save(catalog != null ? Json.ParseObject(catalog.DefaultPolicyJson) : new Dictionary<string, object>(),
+                    false, catalog?.DefaultPolicyJson);
+                bool picked = false;
+                for (int i = 0; i < 50 && !picked; i++) { System.Threading.Thread.Sleep(100); picked = live.CurrentSeq == 2; }
+                Check(picked, "9.2 外部保存 seq=2 → 运行中的实例自动拾取（无需重启）", "now=" + live.CurrentSeq);
+
+                File.WriteAllText(Path.Combine(watchDir, "policy.envelope"), envelopeSeq1, new UTF8Encoding(false));
+                System.Threading.Thread.Sleep(800);
+                Check(live.CurrentSeq == 2, "9.3 有人把旧信封放回磁盘 → 拒绝（保留现行 seq=2）", "now=" + live.CurrentSeq);
+
+                File.WriteAllText(Path.Combine(watchDir, "policy.envelope"), "LGSRV1|99|garbage", new UTF8Encoding(false));
+                System.Threading.Thread.Sleep(800);
+                Check(live.CurrentSeq == 2 && live.CurrentEnvelope != null,
+                    "9.4 磁盘上是坏文件 → 拒绝且不影响现行策略", "now=" + live.CurrentSeq);
+                live.StopWatching();
             }
         }
 

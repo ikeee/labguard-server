@@ -49,6 +49,7 @@ namespace LabGuardServer
             try
             {
                 _store.Load();
+                _store.StartWatching();   // 外部（CLI/脚本/以后的管理端）保存的策略也要能被拾取
             }
             catch (Exception ex)
             {

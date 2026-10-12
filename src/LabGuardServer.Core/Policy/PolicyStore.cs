@@ -65,7 +65,8 @@ namespace LabGuardServer.Core.Policy
                 CurrentSeq = 0;
                 return;
             }
-            string raw = File.ReadAllText(PolicyPath, Encoding.UTF8);
+            string raw = ReadDiskEnvelope();
+            if (raw == null) throw new InvalidDataException("策略信封读不到（文件缺失或持续被占用）：" + PolicyPath);
             EnvelopeData d = PolicyEnvelope.Parse(raw, _keys.Rsa);
             if (!d.Verified)
                 throw new InvalidDataException("策略信封验签失败（policy.envelope 疑似被篡改）——拒绝加载，请人工检查 " + PolicyPath);
@@ -143,6 +144,107 @@ namespace LabGuardServer.Core.Policy
         }
 
         // ------------------------------------------------------------------ seq 水位
+
+        // ------------------------------------------------------------------ 磁盘策略热拾取
+
+        private FileSystemWatcher _watcher;
+
+        /// <summary>
+        /// 盯住 <c>policy.envelope</c>：**外部保存的策略也能被运行中的服务端拾取**。
+        ///
+        /// 为什么需要：服务端的内存策略只在启动时读一次；而策略可能被另一个进程写下——
+        /// 无人值守脚本用 CLI 保存、或以后做成 Windows 服务时由管理端保存。
+        /// 没有它，就会出现"磁盘上是新策略、/api/policy 还在发旧信封"的静默不一致。
+        ///
+        /// 安全口径与启动加载完全一致：**先验签、再比 seq 下限（水位/现行），通过才提交**；
+        /// 任何失败都保留现行信封并记日志（可被人放回旧信封诱发的回退，在这里也被拦住）。
+        /// </summary>
+        public void StartWatching()
+        {
+            if (_watcher != null) return;
+            try
+            {
+                Directory.CreateDirectory(DataDir);
+                _watcher = new FileSystemWatcher(DataDir, PolicyFileName)
+                {
+                    NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName,
+                    EnableRaisingEvents = true,
+                };
+                _watcher.Changed += (s, e) => TryReloadFromDisk();
+                _watcher.Created += (s, e) => TryReloadFromDisk();
+                _watcher.Renamed += (s, e) => TryReloadFromDisk();
+                Log.Info("已盯住策略文件（外部保存的策略会被自动拾取）：" + PolicyPath);
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("启动策略文件监视失败（只能靠重启拾取外部改动）：" + ex.Message);
+                _watcher = null;
+            }
+        }
+
+        public void StopWatching()
+        {
+            try { if (_watcher != null) { _watcher.EnableRaisingEvents = false; _watcher.Dispose(); } } catch { }
+            _watcher = null;
+        }
+
+        /// <summary>尝试从磁盘拾取更新的策略。返回 true = 确实换了现行的信封。</summary>
+        public bool TryReloadFromDisk()
+        {
+            try
+            {
+                if (!File.Exists(PolicyPath)) return false;
+                string disk = ReadDiskEnvelope();
+                if (disk == null) return false;
+                if (disk == CurrentEnvelope) return false;
+                EnvelopeData d = PolicyEnvelope.Parse(disk, _keys.Rsa);
+                if (!d.Verified)
+                {
+                    Log.Error("磁盘策略信封验签失败，拒绝加载（保留现行策略）：" + PolicyPath);
+                    return false;
+                }
+                ulong floor = Math.Max(Watermark, CurrentSeq);
+                if (d.Seq < floor)
+                {
+                    Log.Error("磁盘策略 seq=" + d.Seq + " 低于现行/水位 " + floor +
+                              "，拒绝加载（防回退，保留现行策略）");
+                    return false;
+                }
+                CurrentEnvelope = disk;
+                CurrentSeq = d.Seq;
+                SaveWatermark(Math.Max(Watermark, d.Seq));
+                Log.Info("已拾取磁盘上的新策略：seq=" + d.Seq);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log.Error("拾取磁盘策略失败（保留现行策略）", ex);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 读磁盘信封，**带退避重试**：Windows 下 FileSystemWatcher 的事件常常在写入者还没关闭文件时就到，
+        /// 直接读会抛 IOException（真机踩过：外部保存 seq=2 后永远重载不上）。
+        /// 读到即返回；文件不存在返回 null；2 秒仍读不到则放弃（等下一次事件）。
+        /// </summary>
+        private string ReadDiskEnvelope()
+        {
+            for (int attempt = 0; attempt < 25; attempt++)
+            {
+                try
+                {
+                    using (var fs = new FileStream(PolicyPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                    using (var sr = new StreamReader(fs, Encoding.UTF8))
+                        return sr.ReadToEnd();
+                }
+                catch (FileNotFoundException) { return null; }
+                catch (DirectoryNotFoundException) { return null; }
+                catch (IOException) { System.Threading.Thread.Sleep(80); }
+            }
+            Log.Warn("策略文件在约 2 秒内一直不可读（可能正被写入），本次不重载");
+            return null;
+        }
 
         /// <summary>
         /// 读水位（<c>seq.highwater</c>，格式 <c>{"schemaVersion":1,"seq":N}</c>）。

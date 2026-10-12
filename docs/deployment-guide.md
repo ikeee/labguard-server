@@ -82,6 +82,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1 -Password 你的口令123 -
 | 学生机策略没变 | 学生机服务在不在跑；`server-state.json` 的 `appliedSeq` 与教师机策略面板显示的 seq | 教师机没保存过策略（503）→ 先在策略面板保存一次 |
 | 学生机显示"服务器全员暂停中" | 教师机策略面板的暂停状态 | 教师机点【全员恢复】 |
 | 想看详细日志 | 教师机：`C:\ProgramData\LabGuardServer\logs\`；学生机：`C:\ProgramData\LabGuard\logs\` | 日志不含口令与私钥，可直接发给管理员排查 |
+| 日志里有 `429` | 服务端对 `/api/checkin` 限速：**同一 IP 每秒最多 5 次**（防伪造心跳淹没） | 正常机房每台学生机一个 IP、60 秒一次心跳，不会撞限；若整个机房经 NAT 走同一个 IP 且集中开机，可能出现 `429` —— 客户端会自动在下个周期重试，**不影响策略下发** |
 
 ## 5. 卸载
 

@@ -69,7 +69,7 @@ namespace LabGuardServer
             catch (Exception ex) { output.WriteLine("提示：开关目录快照不可用（" + ex.Message + "）——不能用 --policy-default"); }
 
             var store = new PolicyStore(dataDir, keys);
-            try { store.Load(); }
+            try { store.Load(); store.StartWatching(); }
             catch (Exception ex)
             {
                 output.WriteLine("失败：策略信封加载被拒（" + ex.Message + "）。请人工检查 " +
