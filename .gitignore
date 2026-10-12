@@ -10,3 +10,4 @@ _ReSharper.*/
 *.md5
 HANDOFF.md
 catalog-snapshot.sha256
+src/LabGuardServer.Installer/payload/

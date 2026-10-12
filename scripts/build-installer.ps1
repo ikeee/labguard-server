@@ -37,7 +37,16 @@ if (-not $SkipBuild) {
 }
 
 Write-Host '=== 2. 构建安装器（内嵌服务端本体）==='
-& dotnet build $installerProj -c Release --nologo -v minimal | Select-Object -Last 2
+$payload = Join-Path $repo 'src\LabGuardServer.Installer\payload'
+if (Test-Path $payload) { [System.IO.Directory]::Delete($payload, $true) }
+[System.IO.Directory]::CreateDirectory((Join-Path $payload 'assets')) | Out-Null
+Copy-Item $srvExe (Join-Path $payload 'LabGuardServer.exe') -Force
+Copy-Item (Join-Path $repo 'src\LabGuardServer\bin\Release\net48\LabGuardServer.exe.config') (Join-Path $payload 'LabGuardServer.exe.config') -Force -ErrorAction SilentlyContinue
+Copy-Item $srvCore (Join-Path $payload 'LabGuardServer.Core.dll') -Force
+Copy-Item (Join-Path $repo 'assets\catalog.json') (Join-Path $payload 'assets\catalog.json') -Force
+Write-Host ("  已准备包体：" + (Get-ChildItem $payload -Recurse -File | Measure-Object).Count + " 个文件")
+# --no-incremental：包体是"新文件"，增量构建可能不重编，结果装上的是没内嵌本体的空壳（实测）
+& dotnet build $installerProj -c Release --no-incremental --nologo -v minimal | Select-Object -Last 2
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path $installerExe)) { Write-Host '安装器构建失败' -ForegroundColor Red; exit 1 }
 
 Write-Host '=== 3. 打包后自检：安装器里必须真的内嵌了本体 ==='

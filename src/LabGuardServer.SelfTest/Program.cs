@@ -9,7 +9,6 @@ using LabGuardServer.Core.Api;
 using LabGuardServer.Core.Catalog;
 using LabGuardServer.Core.Envelope;
 using LabGuardServer.Core.Policy;
-using LabGuardServer.Core.Security;
 using LabGuardServer.Core.Util;
 
 namespace LabGuardServer.SelfTest
@@ -349,14 +348,35 @@ namespace LabGuardServer.SelfTest
                 }
                 Check(true, "6.7 Stop 后端口释放（无异常）");
 
-                // ================================================================ [7] 密码
-                Console.WriteLine("[7] 口令散列");
-                string hash = PasswordHasher.Create("a1b2c3");
-                Check(PasswordHasher.Verify("a1b2c3", hash), "7.1 正确密码验证通过");
-                Check(!PasswordHasher.Verify("a1b2c4", hash), "7.2 错误密码拒绝");
-                Check(PasswordHasher.Validate("123456") != null && PasswordHasher.Validate("a1b2c3") == null,
-                    "7.3 弱口令检出 / 正常口令放行");
-                Check(!PasswordHasher.Verify("a1b2c3", "not-a-hash"), "7.4 散列格式损坏安全拒绝");
+                // ================================================================ [7] 策略检索与差异
+                // 教师端"快速找到对应策略"的底座：搜索命中规则 + 发布前差异预览（都是纯函数，必须可测）。
+                // 注：原 [7] 口令散列已随"策略面板不再要密码"（2026-10-12 产品决定）删除。
+                Console.WriteLine("[7] 策略检索与差异预览");
+                var fields = catalog.Fields;
+                Check(PolicySearch.Matches(fields.First(f => f.Path == "Usb.AllowStorage"), "USB"),
+                    "7.1 关键词命中分组名（USB → 6、USB存储设备）");
+                Check(PolicySearch.Matches(fields.First(f => f.Path == "Network.DnsServers"), "dns"),
+                    "7.2 大小写不敏感（dns → DNS 相关开关）");
+                Check(PolicySearch.Filter(fields, "任务管理器").Count >= 1,
+                    "7.3 命中中文提示里的词（任务管理器）",
+                    PolicySearch.Filter(fields, "任务管理器").Count + " 项");
+                Check(PolicySearch.Filter(fields, "   ").Count == fields.Count, "7.4 空关键词 = 全部（不筛选）");
+                Check(PolicySearch.Filter(fields, "USB 存储").Count >= 1, "7.5 多个词 = AND（USB 存储）");
+                Check(PolicySearch.Filter(fields, "这个词一定不存在").Count == 0, "7.6 无命中返回空");
+
+                var oldPolicy = Json.ParseObject(catalog.DefaultPolicyJson);
+                var newPolicy = Json.ParseObject(catalog.DefaultPolicyJson);
+                Check(PolicyDiff.Compare(oldPolicy, newPolicy, fields).Count == 0, "7.7 两份相同策略 → 差异 0 条");
+                PathAccess.Set(newPolicy, "Network.DnsServers", new[] { "10.28.1.10" });
+                PathAccess.Set(newPolicy, "Classroom.Enabled", false);
+                List<PolicyChange> changes = PolicyDiff.Compare(oldPolicy, newPolicy, fields);
+                Check(changes.Count == 2, "7.8 改两项 → 差异 2 条", changes.Count + " 条");
+                Check(changes.Any(c => c.Path == "Classroom.Enabled" && c.NewText == "关"),
+                    "7.9 布尔值以「开/关」呈现给老师看");
+                Check(changes.Any(c => c.Path == "Network.DnsServers" && c.NewText.Contains("10.28.1.10")),
+                    "7.10 列表值以顿号连接呈现");
+                Check(PolicyDiff.Format(null) == "（空）" && PolicyDiff.Format(true) == "开" &&
+                      PolicyDiff.Format(false) == "关", "7.11 空值/布尔格式化");
 
                 // ================================================================ [8] seq 水位与重启防回退
                 // 执行计划 §B2 不变量 8：服务重启后不得把 seq 回退到旧值。

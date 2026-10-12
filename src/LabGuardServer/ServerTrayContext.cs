@@ -106,33 +106,12 @@ namespace LabGuardServer
         private PolicyForm _policyForm;
         private void OpenPolicyForm()
         {
-            // 密码门禁：首次运行先设置密码；之后每次打开都要验
-            string hash = PasswordGate.StoredHash(Program.DataDir);
-            if (hash == null)
-            {
-                using (var set = new PasswordDialog("第一次使用，设置管理密码", true))
-                {
-                    if (set.ShowDialog() != DialogResult.OK) return;
-                    PasswordGate.SaveHash(Program.DataDir, set.Password);
-                }
-            }
-            else
-            {
-                using (var ask = new PasswordDialog("打开策略面板", false))
-                {
-                    if (ask.ShowDialog() != DialogResult.OK) return;
-                    if (!Core.Security.PasswordHasher.Verify(ask.Password, hash))
-                    {
-                        MessageBox.Show("密码不正确。", PasswordGate.Title("打开策略面板"),
-                            MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                        return;
-                    }
-                }
-            }
-
+            // 策略面板**不要求密码**（2026-10-12 产品决定）：教师机由老师自己管制，且改策略是高频操作，
+            // 每次输密码纯属添堵。安全性由"物理与账号上只有老师能碰这台机器"承担；
+            // 残留风险（学生碰到教师机就能改策略）与替代做法见 docs/deployment-guide.md「安全边界」。
             if (_policyForm == null || _policyForm.IsDisposed)
             {
-                _policyForm = new PolicyForm(this);
+                _policyForm = new PolicyForm(_store, _catalog, _api);
                 _policyForm.Show();
             }
             else

@@ -33,7 +33,7 @@ namespace LabGuardServer
         public static bool WantsCli(string[] args)
         {
             return Has(args, "--headless") || Has(args, "--export-pairing") || Has(args, "--set-policy")
-                || Has(args, "--policy-default");
+                || Has(args, "--policy-default") || Has(args, "--screenshot");
         }
 
         public static int Run(string[] args, string dataDir)
@@ -79,18 +79,24 @@ namespace LabGuardServer
             output.WriteLine("当前策略：seq=" + store.CurrentSeq +
                               (store.CurrentEnvelope == null ? "（尚未配置）" : "") + "  水位=" + store.Watermark);
 
-            // 口令
-            string password = Value(args, "--password");
-            if (!string.IsNullOrEmpty(password))
+            // 界面截图（文档 / 人工核对）：把策略面板的每个分组 + 搜索示例渲染成 PNG，不改变任何策略
+            string shotDir = Value(args, "--screenshot");
+            if (!string.IsNullOrEmpty(shotDir) && catalog != null)
             {
-                if (PasswordGate.StoredHash(dataDir) == null)
+                try
                 {
-                    string weak = Core.Security.PasswordHasher.Validate(password);
-                    if (weak != null) { output.WriteLine("失败：口令不合规——" + weak); return 6; }
-                    PasswordGate.SaveHash(dataDir, password);
-                    output.WriteLine("已设置管理口令。");
+                    System.Windows.Forms.Application.EnableVisualStyles();
+                    System.Windows.Forms.Application.SetCompatibleTextRenderingDefault(false);
                 }
-                else output.WriteLine("提示：本机已有管理口令，本次 --password 未生效（改口令请在图形界面里改）。");
+                catch { }
+                using (var form = new PolicyForm(store, catalog))
+                {
+                    var files = form.RenderScreenshots(shotDir);
+                    foreach (string f in files) output.WriteLine(f);
+                    output.WriteLine("共 " + files.Count + " 张，目录：" + shotDir);
+                }
+                keys.Dispose();
+                return 0;
             }
 
             // 策略

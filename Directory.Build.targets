@@ -1,0 +1,11 @@
+<Project>
+  <!--
+    程序图标（作者 GitHub 头像 · **教师端黑底**）：只给可执行项目挂，类库挂图标无意义。
+    注意必须放在 .targets 而不是 .props：props 的导入时机早于项目自己的 PropertyGroup，
+    那时 $(OutputType) 还没赋值，条件永远不成立（客户端仓库踩过）。
+    图标由 ikeee/labguard 仓库的 _tools/make_app_icon.py 从头像生成（只改背景色，人物像素不动）。
+  -->
+  <PropertyGroup Condition="'$(OutputType)' == 'WinExe' or '$(OutputType)' == 'Exe'">
+    <ApplicationIcon>$(MSBuildThisFileDirectory)src\LabGuardServer\Assets\app.ico</ApplicationIcon>
+  </PropertyGroup>
+</Project>

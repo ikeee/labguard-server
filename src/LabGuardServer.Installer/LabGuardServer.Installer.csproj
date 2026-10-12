@@ -16,16 +16,17 @@
     <Reference Include="Microsoft.CSharp" />
   </ItemGroup>
 
-  <!-- 服务端本体作为资源内嵌：安装器是**单文件 exe**（不依赖外部目录，U 盘/共享拷一个文件就能装） -->
+  <!--
+    服务端本体作为资源内嵌：安装器是**单文件 exe**（不依赖外部目录，U 盘/共享拷一个文件就能装）。
+    刻意不直接内嵌 ..\LabGuardServer\bin\... ：那样在本体重建（尤其非增量重建）时会撞上
+    "评估时文件在、编译时已被删"的竞态（实测 CS1566）。改为由 scripts\build-installer.ps1 先把产物
+    拷进本项目的 payload\ 再内嵌——顺序由打包脚本保证，出问题也报在打包脚本里（而不是神秘的编译错误）。
+  -->
   <ItemGroup>
-    <EmbeddedResource Include="..\LabGuardServer\bin\$(Configuration)\net48\LabGuardServer.exe"
-                      LogicalName="payload/LabGuardServer.exe" Condition="Exists('..\LabGuardServer\bin\$(Configuration)\net48\LabGuardServer.exe')" />
-    <EmbeddedResource Include="..\LabGuardServer\bin\$(Configuration)\net48\LabGuardServer.exe.config"
-                      LogicalName="payload/LabGuardServer.exe.config" Condition="Exists('..\LabGuardServer\bin\$(Configuration)\net48\LabGuardServer.exe.config')" />
-    <EmbeddedResource Include="..\LabGuardServer.Core\bin\$(Configuration)\net48\LabGuardServer.Core.dll"
-                      LogicalName="payload/LabGuardServer.Core.dll" Condition="Exists('..\LabGuardServer.Core\bin\$(Configuration)\net48\LabGuardServer.Core.dll')" />
-    <EmbeddedResource Include="..\..\assets\catalog.json"
-                      LogicalName="payload/assets/catalog.json" />
+    <EmbeddedResource Include="payload\LabGuardServer.exe" LogicalName="payload/LabGuardServer.exe" Condition="Exists('payload\LabGuardServer.exe')" />
+    <EmbeddedResource Include="payload\LabGuardServer.exe.config" LogicalName="payload/LabGuardServer.exe.config" Condition="Exists('payload\LabGuardServer.exe.config')" />
+    <EmbeddedResource Include="payload\LabGuardServer.Core.dll" LogicalName="payload/LabGuardServer.Core.dll" Condition="Exists('payload\LabGuardServer.Core.dll')" />
+    <EmbeddedResource Include="payload\assets\catalog.json" LogicalName="payload/assets/catalog.json" Condition="Exists('payload\assets\catalog.json')" />
   </ItemGroup>
 
 </Project>
