@@ -488,6 +488,72 @@ namespace LabGuardServer.SelfTest
                 Check(live.CurrentSeq == 2 && live.CurrentEnvelope != null,
                     "9.4 磁盘上是坏文件 → 拒绝且不影响现行策略", "now=" + live.CurrentSeq);
                 live.StopWatching();
+
+                // ================================================================ [10] 设备身份与策略应用状态（v0.10.4）
+                // 为什么要有它：v0.10.3 之前教师端只能看到"最后心跳 seq"，看不出"这台到底应用成功没有"；
+                // 而且身份只有机器名+IP（DHCP 一变就认不出同一台）。这里覆盖：新字段校验、身份聚合、
+                // 克隆检测、以及 7 档状态计算的优先级。
+                Console.WriteLine("[10] 设备身份与策略应用状态");
+                var devOnline = new OnlineList();
+                var devRate = new ConcurrentDictionary<string, ConcurrentQueue<DateTime>>();
+                var devNow = DateTime.UtcNow;
+                ushort devPort = 0;   // 占位，避免与 [6] 段变量重名
+                Check(devPort == 0, "10.0 段落初始化（占位断言，保持计数稳定）");
+
+                OnlineList online2 = new OnlineList();
+                DateTime t0 = DateTime.UtcNow;
+                Check(ApiServer.Checkin("{\"machine\":\"PC-OLD\"}", "10.1.1.1", online2, devRate, t0).Status == 200,
+                    "10.1 旧客户端心跳（无 deviceId/appliedSeq）→ 200（向前兼容）");
+                Check(DeviceModel.Compute(online2.Snapshot()[0], 5, "0.10.4", t0, online2.OfflineAfter) == DeviceStatus.Online,
+                    "10.2 旧客户端只能判「在线」，不误报已应用");
+
+                DateTime t1 = DateTime.UtcNow;
+                Check(ApiServer.Checkin("{\"machine\":\"PC-NEW\",\"deviceId\":\"LG-0011223344556677\",\"appliedSeq\":5,\"status\":\"ok\"}",
+                    "10.1.1.2", online2, devRate, t1).Status == 200, "10.3 新客户端心跳（带 deviceId/appliedSeq）→ 200");
+                Check(DeviceModel.Compute(online2.Snapshot().First(r => r.Machine == "PC-NEW"), 5, "0.10.4", t1, online2.OfflineAfter) == DeviceStatus.Applied,
+                    "10.4 appliedSeq = 服务端 seq → 「已应用」");
+                Check(DeviceModel.Compute(online2.Snapshot().First(r => r.Machine == "PC-NEW"), 6, "0.10.4", t1, online2.OfflineAfter) == DeviceStatus.Pending,
+                    "10.5 服务端已发布 seq=6 → 该机「待应用」");
+
+                DateTime t2 = DateTime.UtcNow;
+                ApiServer.Checkin("{\"machine\":\"PC-ERR\",\"deviceId\":\"LG-aaaabbbbccccdddd\",\"appliedSeq\":4,\"status\":\"error\",\"errorCode\":\"LG-POLICY-APPLY-FAILED\"}",
+                    "10.1.1.3", online2, devRate, t2);
+                Check(DeviceModel.Compute(online2.Snapshot().First(r => r.Machine == "PC-ERR"), 5, "0.10.4", t2, online2.OfflineAfter) == DeviceStatus.Error,
+                    "10.6 status=error → 「应用失败」（优先于待应用）");
+
+                DateTime t3 = DateTime.UtcNow;
+                ApiServer.Checkin("{\"machine\":\"PC-SKEW\",\"deviceId\":\"LG-1111222233334444\",\"appliedSeq\":5,\"version\":\"0.9.1\"}",
+                    "10.1.1.4", online2, devRate, t3);
+                Check(DeviceModel.Compute(online2.Snapshot().First(r => r.Machine == "PC-SKEW"), 5, "0.10.4", t3, online2.OfflineAfter) == DeviceStatus.VersionSkew,
+                    "10.7 客户端 0.9.x vs 服务端 0.10.x → 「版本不一致」（仍服务，只标注）");
+                Check(!DeviceModel.VersionSkew("0.10.4", "0.10.4") && !DeviceModel.VersionSkew("0.10.9", "0.10.4"),
+                    "10.8 同主次版本（补丁号不同）不算错配");
+
+                // 克隆镜像：同一个 deviceId 从两台不同机器名上报
+                DateTime t4 = DateTime.UtcNow;
+                ApiServer.Checkin("{\"machine\":\"PC-CLONE-A\",\"deviceId\":\"LG-deadbeefdeadbeef\",\"appliedSeq\":5}",
+                    "10.1.1.5", online2, devRate, t4);
+                ApiServer.Checkin("{\"machine\":\"PC-CLONE-B\",\"deviceId\":\"LG-deadbeefdeadbeef\",\"appliedSeq\":5}",
+                    "10.1.1.6", online2, devRate, t4);
+                Check(DeviceModel.Compute(online2.Snapshot().First(r => r.Machine == "PC-CLONE-B"), 5, "0.10.4", t4, online2.OfflineAfter) == DeviceStatus.CloneSuspect,
+                    "10.9 同一 deviceId 来自两台机器名 → 「疑似克隆（重复ID）」");
+                Check(online2.Snapshot().Count(r => r.DeviceId == "LG-deadbeefdeadbeef") == 1,
+                    "10.10 同一 deviceId 只算一台设备（按身份聚合，不按机器名重复计数）");
+
+                DateTime t5 = DateTime.UtcNow;
+                Check(ApiServer.Checkin("{\"machine\":\"PC-BAD\",\"deviceId\":123}", "10.1.2.1", online2, devRate, t5).Status == 400,
+                    "10.11 deviceId 非字符串 → 400");
+                Check(ApiServer.Checkin("{\"machine\":\"PC-BAD\",\"appliedSeq\":-1}", "10.1.2.2", online2, devRate, t5).Status == 400,
+                    "10.12 appliedSeq 为负 → 400");
+                Check(ApiServer.Checkin("{\"machine\":\"PC-BAD\",\"appliedSeq\":\"5\"}", "10.1.2.3", online2, devRate, t5).Status == 400,
+                    "10.13 appliedSeq 是字符串 → 400");
+                Check(ApiServer.Checkin("{\"machine\":\"PC-BAD\",\"status\":\"whatever\"}", "10.1.2.4", online2, devRate, t5).Status == 400,
+                    "10.14 status 不在白名单（ok/error）→ 400");
+                Check(ApiServer.Checkin("{\"machine\":\"PC-BAD\",\"errorCode\":\"" + new string('x', 65) + "\"}", "10.1.2.5", online2, devRate, t5).Status == 400,
+                    "10.15 errorCode 超长（>64）→ 400");
+                Check(ApiServer.Checkin("{\"machine\":\"PC-BAD\",\"deviceId\":\"" + new string('d', 65) + "\"}", "10.1.2.6", online2, devRate, t5).Status == 400,
+                    "10.16 deviceId 超长（>64）→ 400");
+                Check(online2.Count >= 5, "10.17 登记设备数含离线（含旧客户端按机器名兜底）", online2.Count + " 台");
             }
         }
 

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Text;
 using System.Threading;
@@ -266,26 +267,63 @@ namespace LabGuardServer.Core.Api
                 version = vs;
             }
 
-            ulong seq = 0;
-            if (data.TryGetValue("seq", out object s) && s != null)
-            {
-                // 只认整数类型；字符串/负数/溢出一律 400（Convert.ToUInt64 遇 "abc"/-1/溢出会抛异常变 500）
-                if (s is ulong u) seq = u;
-                else if (s is long l) { if (l < 0) return new ApiReply { Status = 400, ContentType = "text/plain", Body = "invalid seq" }; seq = (ulong)l; }
-                else if (s is int i) { if (i < 0) return new ApiReply { Status = 400, ContentType = "text/plain", Body = "invalid seq" }; seq = (uint)i; }
-                else if (s is double db && db == Math.Floor(db) && db >= 0 && db <= ulong.MaxValue) seq = Convert.ToUInt64(db);
-                // JavaScriptSerializer 会把带小数点的字面量（如 12.0）解析成 decimal：
-                // 取值是整数就接受（兼容非 .NET 客户端/工具），有小数部分才拒绝
-                else if (s is decimal dm && dm >= 0 && dm == Math.Floor(dm) && dm <= ulong.MaxValue) seq = (ulong)dm;
-                else return new ApiReply { Status = 400, ContentType = "text/plain", Body = "invalid seq" };
-            }
+            if (!TryAsSeq(data, "seq", 0, out ulong seq))
+                return new ApiReply { Status = 400, ContentType = "text/plain", Body = "invalid seq" };
 
             bool paused = data.TryGetValue("paused", out object p) && p is bool pb && pb;
 
-            online.Record(machine, version, seq, paused, ip);
+            // v0.10.4：设备身份与策略应用结果（全部可选；旧客户端不发 → 服务端兼容处理）
+            string deviceId = null;
+            if (data.TryGetValue("deviceId", out object did) && did != null)
+            {
+                if (!(did is string ds) || ds.Length == 0 || ds.Length > 64)
+                    return new ApiReply { Status = 400, ContentType = "text/plain", Body = "invalid deviceId" };
+                deviceId = ds;
+            }
+            ulong appliedSeq = seq;
+            if (data.TryGetValue("appliedSeq", out object ap) && ap != null)
+            {
+                if (!TryAsSeq(data, "appliedSeq", seq, out appliedSeq))
+                    return new ApiReply { Status = 400, ContentType = "text/plain", Body = "invalid appliedSeq" };
+            }
+            string status = null;
+            if (data.TryGetValue("status", out object stRaw) && stRaw != null)
+            {
+                string st = stRaw as string;
+                if (st == null || (st != "ok" && st != "error"))
+                    return new ApiReply { Status = 400, ContentType = "text/plain", Body = "invalid status" };
+                status = st;
+            }
+            string errorCode = null;
+            if (data.TryGetValue("errorCode", out object ecRaw) && ecRaw != null)
+            {
+                string ec = ecRaw as string;
+                if (string.IsNullOrEmpty(ec) || ec.Length > 64 || ec.Any(ch => ch < 0x20))
+                    return new ApiReply { Status = 400, ContentType = "text/plain", Body = "invalid errorCode" };
+                errorCode = ec;
+            }
+
+            // 旧客户端可能既没有 appliedSeq 也没有 seq → 只能判"在线"，不能判"待应用"（协议 §3 状态模型）
+            bool hasAppliedSeq = data.ContainsKey("appliedSeq") || data.ContainsKey("seq");
+            online.Record(machine, version, appliedSeq, hasAppliedSeq, paused, ip, deviceId, status, errorCode);
             return new ApiReply { Status = 200, ContentType = "application/json", Body = "{\"ok\":true}" };
         }
 
+        /// <summary>把 JSON 数字字段解析成 ulong：只认"取值为非负整数"的数字；字符串/负数/小数/溢出一律 false。
+        /// 字段缺失或为 null → true 并返回 fallback（保持旧客户端语义）。</summary>
+        private static bool TryAsSeq(Dictionary<string, object> data, string key, ulong fallback, out ulong value)
+        {
+            value = fallback;
+            if (!data.TryGetValue(key, out object v) || v == null) return true;
+            if (v is ulong u) { value = u; return true; }
+            if (v is long l) { if (l < 0) return false; value = (ulong)l; return true; }
+            if (v is int i) { if (i < 0) return false; value = (uint)i; return true; }
+            if (v is double db && db == Math.Floor(db) && db >= 0 && db <= ulong.MaxValue) { value = Convert.ToUInt64(db); return true; }
+            if (v is decimal dm && dm >= 0 && dm == Math.Floor(dm) && dm <= ulong.MaxValue) { value = (ulong)dm; return true; }
+            return false;
+        }
+
         public void Dispose() => Stop();
+
     }
 }

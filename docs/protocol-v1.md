@@ -57,7 +57,7 @@ LGSRV1|<seq>|<issuedAt>|<paused>|<policyJson>|<signature>
 |---|---|---|---|
 | `GET /api/version` | — | `{"seq":123,"sha256":"…","paused":false}` | 轻量探测：客户端对比 seq/sha，无变化不拉全文；`paused` 供托盘/面板展示。`sha256` = **信封全文的 SHA-256**，客户端可直接用作完整性 pin |
 | `GET /api/policy` | — | `text/plain; charset=utf-8`：LGSRV1 信封全文 | 全量策略下发 |
-| `POST /api/checkin` | `{"machine":"PC-01","version":"0.10","seq":123,"paused":false}` | `{"ok":true}` | 心跳上报；服务端聚合出在线学生机列表（默认 60s 无心跳判离线） |
+| `POST /api/checkin` | `{"machine":"PC-01","version":"0.10.4","seq":123,"paused":false,"deviceId":"LG-1a2b…","appliedSeq":123,"status":"ok"}` | `{"ok":true}` | 心跳上报；服务端聚合出在线学生机列表与**每台设备的策略应用状态**（默认 60s 无心跳判离线） |
 
 - 编码：请求体按 `Content-Encoding`（缺省 UTF-8）解码；响应一律 UTF-8
   （`/api/version`、`/api/checkin` 为 `application/json`，`/api/policy` 为 `text/plain; charset=utf-8`）。
@@ -76,6 +76,30 @@ LGSRV1|<seq>|<issuedAt>|<paused>|<policyJson>|<signature>
 | `version` | 否 | 字符串 ≤32 字符；**给了但类型不对 → 400**（不悄悄吞） | `400 invalid version` |
 | `seq` | 否 | JSON 数字且**取值为非负整数**（`12` 与 `12.0` 都算；底层类型可能是 int/long/ulong/decimal/double）；字符串/负数/**有小数部分**/溢出一律拒绝 | `400 invalid seq` |
 | `paused` | 否 | 布尔 | 忽略其他类型 |
+
+### checkin 字段校验（v0.10.4 增补：设备身份与策略确认）
+
+| 字段 | 必填 | 合法类型 | 违规响应 | 说明 |
+|---|---|---|---|---|
+| `deviceId` | 否 | 字符串 ≤64；建议 `LG-` + 16 位十六进制 | `400 invalid deviceId` | **稳定设备身份**：客户端首次配对/安装时生成并落盘，重启/改机器名/换 IP 都不变。旧客户端不发送 → 服务端用 `machine` 兜底 |
+| `appliedSeq` | 否 | 整数（≥0），规则同 `seq` | `400 invalid appliedSeq` | 客户端**已成功应用**的策略序号（用于 Pending / Applied 判定） |
+| `status` | 否 | 字符串，白名单 `ok` / `error` | `400 invalid status` | 应用结果；缺省视为 `ok` |
+| `errorCode` | 否 | 字符串 ≤64 | `400 invalid errorCode` | `status=error` 时的稳定错误码（如 `LG-POLICY-APPLY-FAILED`）；不含敏感信息 |
+
+### 设备状态模型（v0.10.4，服务端在线列表展示）
+
+| 状态 | 判定 |
+|---|---|
+| `Offline` | 超过阈值（默认 60s）没有心跳 |
+| `Applied` | 有心跳，且 `appliedSeq >= 服务端当前 seq` |
+| `Pending` | 有心跳，`appliedSeq < 服务端当前 seq`（已发布新策略、该机还没用上） |
+| `Error` | 最近一次心跳 `status=error` |
+| `VersionSkew` | 客户端 `version` 的**主次版本**与服务端不一致（仍继续服务，只在列表标注） |
+| `Online` | 有心跳但没带 `appliedSeq`（旧客户端，只能证明"人在线"） |
+| `CloneSuspect` | **同一个 `deviceId` 最近来自多台不同机器名/IP** → 疑似克隆系统镜像带来的重复身份（诊断信息，不拒绝服务） |
+
+> 上报的 `deviceId` / `appliedSeq` / `status` / `errorCode` 都是**固定 schema、有长度上限、字段白名单**，
+> 属于 §1.2 允许的"客户端状态数据"，不构成通用文件传输通道。
 
 ## 4. 客户端行为状态机
 
