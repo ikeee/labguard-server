@@ -84,6 +84,25 @@ powershell -File scripts\testbed-clients.ps1      # 21 项场景：真教师端 
 细节与场景矩阵见 [docs/e2e-testbed.md](docs/e2e-testbed.md)。**先跑安全闸**——沙箱没有真正隔离时，
 场景里的"学生端"会按真策略改掉开发机（2026-10-13 就是这么踩的）。
 
+### 两间机房在同一网段（互不干扰的验收）
+
+```powershell
+powershell -File scripts\two-room-isolation.ps1     # 15 项断言：两个教师端 + 五个沙箱
+```
+
+结论：**默认就隔离**（学生端只连配对文件里写死的那一个教师机，且把它的公钥钉在本机 → 别的教师机发策略一律验签失败）。
+部署要点与 3 个真会串房的坑（配对文件串用 / 教师机镜像克隆 / 同网段 IP 冲突）见
+[docs/deployment-guide.md §8](docs/deployment-guide.md)。教师端侧还可以：
+
+```bat
+LabGuardServer.exe --data-dir %ProgramData%\LabGuardServer --room-set A202 --expect-ips 10.46.254.11-99
+LabGuardServer.exe --data-dir %ProgramData%\LabGuardServer --room-info
+LabGuardServer.exe --data-dir %ProgramData%\LabGuardServer --audit-tail 50 --audit-verify
+LabGuardServer.exe --data-dir %ProgramData%\LabGuardServer --export-devices D:\A202-设备.csv
+```
+
+不在期望 IP 段内的设备会在「设备清单」里标 `⚠跨机房`（装配错当场可见）。
+
 ### 临时课堂状态（v0.12：上课/严管/考试一键切，到点自动回基础策略）
 
 ```bat

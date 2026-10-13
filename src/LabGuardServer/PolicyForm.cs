@@ -48,6 +48,7 @@ namespace LabGuardServer
         private readonly Action _openGroupsUi;
         private readonly TempStateManager _temp;                   // v0.12 临时课堂状态（可为空 → 不显示临时入口）
         private readonly TempStartDelegate _startTemp;             // (名字,补丁,暂停,分钟) → 给人看的消息
+        private readonly LabGuardServer.Core.Audit.AuditLog _audit; // v0.14 审计（可为空 → 只记日志不落审计）
 
         private readonly TextBox _search = new TextBox { BorderStyle = BorderStyle.FixedSingle };
         private readonly CheckBox _onlyChanged = new CheckBox { Text = "只看已改动", AutoSize = true };
@@ -74,7 +75,8 @@ namespace LabGuardServer
             Func<DeviceGroup, Dictionary<string, object>, bool, ulong> publishGroup = null,
             Action openGroupsUi = null,
             TempStateManager temp = null,
-            TempStartDelegate startTemp = null)
+            TempStartDelegate startTemp = null,
+            LabGuardServer.Core.Audit.AuditLog audit = null)
         {
             _store = store;
             _catalog = catalog;
@@ -84,6 +86,7 @@ namespace LabGuardServer
             _openGroupsUi = openGroupsUi;
             _temp = temp;
             _startTemp = startTemp;
+            _audit = audit;
 
             Icon = AppIcon.Get();
             Text = "LabGuard 教师端 · 策略面板（只负责下发策略；改完点「保存并下发」）";
@@ -621,9 +624,13 @@ namespace LabGuardServer
                     return;
                 }
                 bool paused = _store.Version()?.Paused ?? false;
+                ulong prevSeq = _store.Version()?.Seq ?? 0;
                 PolicyVersion v = _store.Save(_policy, paused, _catalog.DefaultPolicyJson);
                 // 正在临时状态中又改了基础策略 → 临时层要按新基础重算（否则临时信封停在旧基础上）
                 _temp?.RefreshIfActive("面板保存了默认策略");
+                _audit?.Write(LabGuardServer.Core.Audit.AuditAction.PolicyPublish, "policy", "default",
+                    prevSeq, v.Seq, "ok", null, "下发默认策略（策略面板）：" +
+                    LabGuardServer.Core.Audit.AuditSummary.PolicyChanges(_published, _policy, _catalog?.Fields));
                 _published = Json.ParseObject(Json.Stringify(_policy));
                 RebuildTree();
                 RebuildBody();
@@ -692,6 +699,11 @@ namespace LabGuardServer
                 }
                 _store.Save(_policy, paused, _catalog.DefaultPolicyJson);
                 _temp?.RefreshIfActive(paused ? "面板全员暂停" : "面板全员恢复");
+                _audit?.Write(paused ? LabGuardServer.Core.Audit.AuditAction.PolicyPause
+                                     : LabGuardServer.Core.Audit.AuditAction.PolicyResume,
+                    "policy", "default", _store.CurrentSeq, _store.CurrentSeq, "ok", null,
+                    paused ? "全员暂停（来自策略面板；学生机停止管控策略，进程守护照旧）"
+                           : "全员恢复（来自策略面板；学生机回到服务器策略管控）");
                 _published = Json.ParseObject(Json.Stringify(_policy));
                 RebuildTree();
                 RefreshStatus();

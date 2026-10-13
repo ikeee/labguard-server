@@ -98,9 +98,24 @@ namespace LabGuardServer.Core.Policy
             try
             {
                 if (!File.Exists(path)) return null;
+                return Parse(File.ReadAllText(path, Encoding.UTF8));
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("读取临时状态失败（按『无临时状态』处理）：" + ex.Message);
+                return null;
+            }
+        }
+
+        /// <summary>从**已经在内存里的文本**解析（热拾取用：读一次文件，既算内容签名又解析，不重复读盘）。</summary>
+        public static TempState Parse(string text)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(text)) return null;
                 var doc = new JavaScriptSerializer { MaxJsonLength = 8 * 1024 * 1024 }
-                    .Deserialize<Dictionary<string, object>>(File.ReadAllText(path, Encoding.UTF8));
-                if (doc == null) { Log.Warn("临时状态文件不是 JSON 对象，已忽略：" + path); return null; }
+                    .Deserialize<Dictionary<string, object>>(text);
+                if (doc == null) { Log.Warn("临时状态文件不是 JSON 对象，已忽略"); return null; }
                 int schema = doc.TryGetValue("schemaVersion", out object sv) && sv is IConvertible ? Convert.ToInt32(sv) : 0;
                 if (schema != SchemaVersion)
                 {
@@ -136,7 +151,7 @@ namespace LabGuardServer.Core.Policy
             }
             catch (Exception ex)
             {
-                Log.Warn("读取临时状态失败（按『无临时状态』处理）：" + ex.Message);
+                Log.Warn("解析临时状态失败（按『无临时状态』处理）：" + ex.Message);
                 return null;
             }
         }

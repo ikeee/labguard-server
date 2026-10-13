@@ -6,6 +6,7 @@ using System.Linq;
 using System.Net;
 using System.Text;
 using LabGuardServer.Core.Api;
+using LabGuardServer.Core.Audit;
 using LabGuardServer.Core.Catalog;
 using LabGuardServer.Core.Envelope;
 using LabGuardServer.Core.Policy;
@@ -626,6 +627,35 @@ namespace LabGuardServer.SelfTest
                 Check(groupsReloaded.GroupNameOf("LG-aaaa000011112222", "PC-101") == GroupStore.DefaultGroupName,
                     "11.11 组名显示回落为「" + GroupStore.DefaultGroupName + "」");
 
+                // 11.12 回归：原子替换的"文件消失窗口"不能被误判成"分组被删"
+                // （v0.12 实测：一整节课的分组归属全丢，设备清单里全班都变成 group=默认策略）
+                string raceDir = Path.Combine(tmp, "grouprace");
+                Directory.CreateDirectory(raceDir);
+                var raceWriter = new GroupStore(raceDir);
+                raceWriter.Load();
+                DeviceGroup raceGroup = raceWriter.Add("竞赛组");
+                raceWriter.Assign(raceGroup.Id, "LG-race", null);
+                raceWriter.Save();
+                var raceWatch = new GroupStore(raceDir);
+                raceWatch.Load();
+                File.Delete(raceWriter.GroupsPath);      // 模拟 AtomicFile 替换瞬间：文件暂时不存在
+                var rewriter = new System.Threading.Timer(_ =>
+                {
+                    try { raceWriter.Save(); } catch { }    // 100ms 后写回来（正常的重写行为）
+                }, null, 100, System.Threading.Timeout.Infinite);
+                // 内容没变的重写：不重载（返回 false）**但绝不能把内存里的组清空**
+                bool raceOk = !raceWatch.TryReloadFromDisk() && raceWatch.Groups.Count == 1 &&
+                              raceWatch.Resolve("LG-race", null) != null;
+                rewriter.Dispose();
+                Check(raceOk,
+                    "11.12 原子替换的『文件消失窗口』：不重载、更**不误判为分组被删**（归属不能丢）",
+                    "重载后分组数=" + raceWatch.Groups.Count);
+                // 内容真变了 → 必须认出来（否则老师改完分组学生机永远看不到）
+                raceWriter.Add("竞赛组2");
+                raceWriter.Save();
+                Check(raceWatch.TryReloadFromDisk() && raceWatch.Groups.Count == 2,
+                    "11.12b 内容变了 → 立刻拾取（分组数 1 → 2）", "分组数=" + raceWatch.Groups.Count);
+
                 // ================================================================ [12] 临时课堂状态层（v0.12）
                 // 有效策略 = 基础策略 ⊕ 临时覆盖；覆盖在**发布时**合成、照旧签名 + 排 seq 下发（客户端零改动）。
                 // 三件事必须成立：合并规则确定可测、三层解析（临时 > 分组 > 默认）、到期/重启都能可靠回到基础策略。
@@ -786,6 +816,184 @@ namespace LabGuardServer.SelfTest
                 mgr3.Load(DateTime.UtcNow);
                 Check(!mgr3.Active && !File.Exists(TempState.PathOf(tdir)),
                     "12.16 临时状态里的信封验签不过 → 拒绝采用并删掉文件（绝不把不可信内容发出去）");
+                }
+
+                // ================================================================ [13] 审计日志与 CSV 导出（v0.14）
+                // 执行计划 §G1/§G2：留痕能追溯（哈希链防改动）、不记秘密、有轮转与上限、导出的 CSV 防公式注入。
+                Console.WriteLine("[13] 审计日志与 CSV 导出（LG-107 / LG-108）");
+                {
+                    // ---- 13.1~13.3 CSV 基础口径（纯函数）
+                    Check(Csv.Escape("a,b") == "\"a,b\"", "13.1a CSV 转义：逗号字段被引号包起来",
+                        Csv.Escape("a,b"));
+                    Check(Csv.Escape("he said \"hi\"") == "\"he said \"\"hi\"\"\"",
+                        "13.1b CSV 转义：引号被双写成两个",
+                        Csv.Escape("he said \"hi\""));
+                    Check(Csv.Escape("line1\nline2") == "\"line1\nline2\"",
+                        "13.1c CSV 转义：多行字段被引号包起来",
+                        Csv.Escape("line1\nline2"));
+                    Check(Csv.Escape("=cmd|' /C calc'!A0").StartsWith("'=") &&
+                          Csv.Escape("+1+1").StartsWith("'+") &&
+                          Csv.Escape("-2+3").StartsWith("'-") &&
+                          Csv.Escape("@SUM(A1)").StartsWith("'@") &&
+                          Csv.Escape("\t=x").StartsWith("'"),
+                        "13.2 CSV **公式注入防护**：= + - @ 与 Tab 开头一律加单引号变成纯文本");
+                    string csvPath = Path.Combine(tmp, "audit-export.csv");
+                    Csv.WriteFile(csvPath, new[] { Csv.Line("列一", "列二"), Csv.Line("=危险", "普通") });
+                    byte[] csvBytes = File.ReadAllBytes(csvPath);
+                    string csvText = File.ReadAllText(csvPath, Encoding.UTF8);
+                    Check(csvBytes[0] == 0xEF && csvBytes[1] == 0xBB && csvBytes[2] == 0xBF &&
+                          csvText.Contains("\r\n") && csvText.Contains("'=危险"),
+                        "13.3 CSV 文件：UTF-8 **带 BOM**（Excel 认中文）+ CRLF + 注入字段已中和");
+
+                    // ---- 13.4~13.9 审计日志本体
+                    string adir = Path.Combine(tmp, "audit");
+                    Directory.CreateDirectory(adir);
+                    var audit = new AuditLog(adir, new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 });
+                    Check(audit.Write(AuditAction.PolicyPublish, "policy", "default", 1, 2, "ok", null,
+                              "改动 1 项：禁用任务管理器（Shell.DisableTaskManager） 关→开；"),
+                        "13.4 记一条策略发布");
+                    audit.Write(AuditAction.TempStart, "classroom", "考试模式", 2, 3, "ok", null, "临时状态开始");
+                    audit.Write(AuditAction.TempExpire, "classroom", "考试模式", 3, 4, "ok", null, "到点自动恢复");
+                    List<AuditEntry> back = audit.ReadAll();
+                    Check(back.Count == 3 && back[0].Seq == 1 && back[0].Action == AuditAction.PolicyPublish &&
+                          back[0].Result == "ok" && back[0].NewPolicySeq == 2 &&
+                          back[0].PrevPolicySeq == 1 && !string.IsNullOrEmpty(back[0].Summary) &&
+                          back[0].LocalTime.Length == 19,
+                        "13.4 落盘后读得回来（字段齐全；库里 UTC、显示用本地时间）", back.Count + " 条");
+                    AuditVerifyResult av1 = audit.Verify();
+                    Check(av1.Ok && av1.Entries == 3 && av1.KeyAvailable,
+                        "13.5 哈希链校验通过（密钥可用）", av1.Reason);
+
+                    // 篡改①：改一个字段
+                    string file1 = audit.Files()[0];
+                    string[] lines = File.ReadAllLines(file1, Encoding.UTF8);
+                    lines[1] = lines[1].Replace("临时状态开始", "被我改过了");
+                    File.WriteAllLines(file1, lines, new UTF8Encoding(false));
+                    AuditVerifyResult av2 = audit.Verify();
+                    Check(!av2.Ok && av2.Reason.Contains("改过"),
+                        "13.6 改一个字段 → 链校验立刻报『内容被改过』", av2.Reason);
+
+                    // 篡改②：删掉中间一条（seq 不连续 / prevHash 接不上）
+                    File.WriteAllLines(file1, new[] { lines[0], lines[2] }, new UTF8Encoding(false));
+                    AuditVerifyResult av3 = audit.Verify();
+                    Check(!av3.Ok, "13.7 删掉一条 → 链校验失败（seq 断号）", av3.Reason);
+
+                    // ---- 13.8 脱敏：塞机密进来也不该原样落盘
+                    string secret = "pbkdf2-sha256$100000$abcdef$0123456789abcdef";
+                    var audit2 = new AuditLog(Path.Combine(tmp, "audit2"), new byte[] { 9, 9, 9 });
+                    audit2.Write(AuditAction.PanelOpen, "panel", "policy", 0, 0, "ok", null,
+                        "有人试图把口令散列写进日志：" + secret + " 后面还有很长的内容" + new string('x', 600));
+                    string raw2 = File.ReadAllText(audit2.Files()[0], Encoding.UTF8);
+                    Check(!raw2.Contains(secret) && raw2.Contains("[已脱敏]") && raw2.Length < 2000,
+                        "13.8 **脱敏**：口令散列被改写、超长摘要被截断（机密不入日志）");
+
+                    // ---- 13.9 轮转：总大小上限一到就删最老的
+                    string adir3 = Path.Combine(tmp, "audit3");
+                    Directory.CreateDirectory(adir3);
+                    for (int i = 1; i <= 5; i++)
+                        File.WriteAllText(Path.Combine(adir3, AuditLog.FilePrefix + "2026010" + i + AuditLog.FileSuffix),
+                            new string('a', 1000), new UTF8Encoding(false));
+                    var audit3 = new AuditLog(adir3, new byte[] { 7 });
+                    int removed = audit3.Rotate(3000, 120);
+                    Check(removed == 2 && audit3.Files().Count == 3,
+                        "13.9 **轮转**：总大小超过上限就删最老的（删了 " + removed + " 个，剩 " + audit3.Files().Count + " 个）");
+
+                    // ---- 13.10 写审计失败不得影响业务（返回 false、不抛异常）
+                    string notADir = Path.Combine(tmp, "not-a-dir");
+                    File.WriteAllText(notADir, "x", new UTF8Encoding(false));
+                    var broken = new AuditLog(Path.Combine(notADir, "sub"), new byte[] { 1 });
+                    bool wrote = true;
+                    try { wrote = broken.Write(AuditAction.ServerStart, "server", "headless", 0, 0, "ok", null, "应失败"); }
+                    catch (Exception ex) { Check(false, "13.10 写审计失败不得抛异常", ex.Message); }
+                    Check(!wrote, "13.10 写不进去时返回 false 且**不抛异常**（策略发布结果不会被审计拖累）");
+
+                    // ---- 13.11 临时状态的开/关/到期都要留痕（TempStateManager 直接接审计）
+                    string adir4 = Path.Combine(tmp, "audit4");
+                    Directory.CreateDirectory(adir4);
+                    var aStore = new PolicyStore(adir4, keys);
+                    aStore.Load();
+                    aStore.Save(Json.ParseObject(catalog.DefaultPolicyJson), false, catalog.DefaultPolicyJson);
+                    var aGroups = new GroupStore(adir4);
+                    aGroups.Load();
+                    var audit4 = new AuditLog(adir4, new byte[] { 5, 5 });
+                    var mgr4 = new TempStateManager(adir4, keys, aStore, aGroups) { Auditor = audit4 };
+                    mgr4.Start("考试模式", "{}", false, DateTime.UtcNow.AddSeconds(1), "自检", DateTime.UtcNow);
+                    bool exp = false;
+                    for (int i = 0; i < 40 && !exp; i++) { System.Threading.Thread.Sleep(200); exp = mgr4.ExpireIfDue(DateTime.UtcNow); }
+                    var acts = audit4.ReadAll().Select(e => e.Action).ToList();
+                    Check(exp && acts.Contains(AuditAction.TempStart) && acts.Contains(AuditAction.TempExpire),
+                        "13.11 临时状态的开与**到期**都自动留痕（到点无人操作也要有记录）",
+                        string.Join(",", acts));
+
+                    // ---- 13.12 审计摘要只写"开关名 + 可读值 + 路径"，绝不写整份策略 JSON
+                    var oldP = Json.ParseObject(catalog.DefaultPolicyJson);
+                    var newP = Json.ParseObject(catalog.DefaultPolicyJson);
+                    // 注意挑一个"默认值不是 true"的开关再翻它，否则"改成 true"等于没改（本次踩过）
+                    PathAccess.Set(newP, "Shell.DisableTaskManager", false);
+                    string sum = AuditSummary.PolicyChanges(oldP, newP, catalog.Fields);
+                    Check(sum.Contains("Shell.DisableTaskManager") && !sum.Contains("PasswordHash") &&
+                          !sum.Contains("{") && sum.Length < 400,
+                        "13.12 摘要口径：写『开关名+路径+新旧值』，**不把策略 JSON / 口令散列抄进日志**", sum);
+
+                    // ---- 13.13 设备 CSV：外部可控字段（机器名）带公式载荷要被中和
+                    var devLines = new List<string>
+                    {
+                        Csv.Line("机器名", "设备ID", "状态"),
+                        Csv.Line("=cmd|' /C calc'!A0", "LG-0011223344556677", "已应用"),
+                    };
+                    string devCsv = Path.Combine(tmp, "devices.csv");
+                    Csv.WriteFile(devCsv, devLines);
+                    string devText = File.ReadAllText(devCsv, Encoding.UTF8);
+                    Check(devText.Contains("'=cmd") && !devText.Contains(",=cmd"),
+                        "13.13 设备表里的**学生可控字段**（机器名）带公式载荷 → 导出时被中和");
+
+                    // ---- 13.14 审计 CSV 头/数据列数一致（不然 Excel 里整张表错列）
+                    var csvLines = AuditCsv.Render(audit4.ReadAll());
+                    int cols = csvLines[0].TrimEnd('\r', '\n').Split(',').Length;
+                    bool same = csvLines.All(l => l.TrimEnd('\r', '\n').Split(',').Length == cols);
+                    Check(csvLines.Count >= 3 && same, "13.14 审计 CSV：表头与数据列数一致（" + cols + " 列）");
+                }
+
+                // ================================================================ [14] 两间机房同网段（v0.14）
+                // 用户真实拓扑：A202 教师机 10.46.254.10 / 学生 11-99；A203 教师机 .100 / 学生 101-199。
+                // 这里钉住"老师怎么写、程序怎么认"，以及"越界设备能不能被标出来"。
+                Console.WriteLine("[14] 本机房 IP 段（两间机房同网段时不互相影响的体检）");
+                {
+                    List<string> badSpecs;
+                    var a202 = RoomScope.Parse("10.46.254.11-99", out badSpecs);
+                    Check(a202.Count == 1 && badSpecs.Count == 0 &&
+                          RoomScope.Contains(a202, "10.46.254.11") && RoomScope.Contains(a202, "10.46.254.99") &&
+                          !RoomScope.Contains(a202, "10.46.254.10") && !RoomScope.Contains(a202, "10.46.254.100") &&
+                          !RoomScope.Contains(a202, "10.46.254.101"),
+                        "14.1 「10.46.254.11-99」解析正确：含 11 与 99，不含教师机 .10、也不含 A203 的 .100/.101");
+                    var longForm = RoomScope.Parse("10.46.254.101-10.46.254.199", out badSpecs);
+                    Check(longForm.Count == 1 && RoomScope.Contains(longForm, "10.46.254.150") &&
+                          !RoomScope.Contains(longForm, "10.46.254.99"),
+                        "14.2 全写法「10.46.254.101-10.46.254.199」也认（两间房的段互不重叠）");
+                    var twoParts = RoomScope.Parse("10.46.254.11-99,192.168.1.5", out badSpecs);
+                    Check(twoParts.Count == 2 && RoomScope.Contains(twoParts, "10.46.254.50") &&
+                          RoomScope.Contains(twoParts, "192.168.1.5") && !RoomScope.Contains(twoParts, "192.168.1.6"),
+                        "14.3 逗号分隔多段 + 单地址混写");
+                    var reversed = RoomScope.Parse("10.46.254.99-11", out badSpecs);
+                    Check(reversed.Count == 1 && RoomScope.Contains(reversed, "10.46.254.55"),
+                        "14.4 起止写反了也认（老师手滑不该导致『整个段失效』）");
+                    var junk = RoomScope.Parse("10.46.254.11-99,abc,999.1.1.1", out badSpecs);
+                    Check(junk.Count == 1 && badSpecs.Count == 2 && RoomScope.Describe(junk) == "10.46.254.11-99",
+                        "14.5 写法不对的项被忽略并**报出来**（不会让服务端起不来，也不会静默失效）", string.Join("、", badSpecs));
+                    Check(RoomScope.Contains(new List<IpRange>(), "8.8.8.8") &&
+                          !RoomScope.Contains(a202, "::1") && !RoomScope.Contains(a202, "10.46.254"),
+                        "14.6 没配段 → 不做越界判定（不误报）；认不出的地址算越界（值得看一眼）");
+
+                    string rdir = Path.Combine(tmp, "room");
+                    Directory.CreateDirectory(rdir);
+                    var rc = new RoomConfig { Room = "A202", ExpectIps = "10.46.254.11-99" };
+                    rc.Save(rdir);
+                    RoomConfig rc2 = RoomConfig.Load(rdir);
+                    Check(rc2.Room == "A202" && rc2.Ranges.Count == 1 && !rc2.IsOutOfScope("10.46.254.42") &&
+                          rc2.IsOutOfScope("10.46.254.150"),
+                        "14.7 本机房信息落盘/读回：A202 认自己的 42，把 A203 的 150 判为越界");
+                    Check(RoomConfig.Load(Path.Combine(tmp, "no-such-room")).Ranges.Count == 0,
+                        "14.8 没配本机房信息也能正常跑（不配 = 不做越界判定）");
                 }
             }
         }

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Text;
 using LabGuardServer.Core.Envelope;
 using LabGuardServer.Core.Logging;
 using LabGuardServer.Core.Util;
@@ -33,10 +34,14 @@ namespace LabGuardServer.Core.Policy
         private readonly GroupStore _groups;
         private readonly object _sync = new object();
         private FileSystemWatcher _watcher;
-        private DateTime _diskStampUtc = DateTime.MinValue;
+        /// <summary>上次看到的 temp-state.json **内容签名**（不用时间戳：原子替换后时间戳不一定变新，实测会漏掉改动）。</summary>
+        private string _diskSig;
 
         /// <summary>当前进行中的临时状态（null = 无）。**只由本类改**。</summary>
         public TempState Current { get; private set; }
+
+        /// <summary>审计日志（可选）：临时状态的开/关/到期都留痕（执行计划 §G1 要求）。</summary>
+        public Audit.AuditLog Auditor { get; set; }
 
         /// <summary>最近一次结束（界面/日志用）：名字、原因、时间。</summary>
         public string LastEndedName { get; private set; }
@@ -81,6 +86,8 @@ namespace LabGuardServer.Core.Policy
                 LastEndedName = t.Name;
                 LastEndedReason = "服务端重启时发现已过期";
                 LastEndedAtUtc = nowUtc;
+                Auditor?.Write(Audit.AuditAction.TempExpire, "classroom", t.Name, t.MaxSeq, _store.CurrentSeq,
+                    "ok", null, "服务端重启时发现临时状态已过期 → 丢弃并重发基础策略（" + t.Name + "）", "系统");
                 return;
             }
             if (!Validate(t, "启动装载"))
@@ -90,7 +97,7 @@ namespace LabGuardServer.Core.Policy
             }
             Current = t;
             Log.Info("已恢复进行中的临时状态【" + t.Name + "】（" + t.RemainingText(nowUtc) + "）");
-            _diskStampUtc = StampNow();
+            MarkDiskSeen();
         }
 
         /// <summary>
@@ -135,22 +142,35 @@ namespace LabGuardServer.Core.Policy
                     string path = TempState.PathOf(_dataDir);
                     if (!File.Exists(path))
                     {
-                        if (_diskStampUtc == DateTime.MinValue) return false;   // 从没见过文件：什么都没变
-                        if (Current == null) { _diskStampUtc = DateTime.MinValue; return false; }
-                        Log.Info("临时状态文件已不存在 → 外部结束了临时状态【" + Current.Name + "】");
-                        Current = null;
-                        _diskStampUtc = DateTime.MinValue;
-                        return true;
+                        if (_diskSig == null) return false;                     // 从没见过文件：什么都没变
+                        // 原子替换存在极短的"文件消失"窗口：重试几次再判定，别把"正在重写"当成"被删除"
+                        bool reappeared = false;
+                        for (int i = 0; i < 4 && !reappeared; i++)
+                        {
+                            System.Threading.Thread.Sleep(60);
+                            reappeared = File.Exists(path);
+                        }
+                        if (reappeared) { /* 落下去走正常的内容比较 */ }
+                        else
+                        {
+                            if (Current == null) { _diskSig = null; return false; }
+                            Log.Info("临时状态文件已不存在 → 外部结束了临时状态【" + Current.Name + "】");
+                            Current = null;
+                            _diskSig = null;
+                            return true;
+                        }
                     }
-                    DateTime stamp = File.GetLastWriteTimeUtc(path);
-                    if (stamp == _diskStampUtc) return false;
-                    TempState t = TempState.Load(_dataDir);
-                    _diskStampUtc = stamp;
+                    string text = ReadDiskText();
+                    if (text == null) return false;
+                    string sig = ContentHash.Of(text);
+                    if (sig == _diskSig) return false;
+                    TempState t = TempState.Parse(text);
+                    _diskSig = sig;
                     if (t == null) return false;
                     if (!Validate(t, "外部拾取"))
                     {
                         TempState.DeleteFile(_dataDir);
-                        _diskStampUtc = DateTime.MinValue;
+                        _diskSig = null;
                         Current = null;
                         return true;
                     }
@@ -166,6 +186,36 @@ namespace LabGuardServer.Core.Policy
                     return false;
                 }
             }
+        }
+
+        /// <summary>读临时状态文件（带退避重试：写入方可能还没关闭文件）。</summary>
+        private string ReadDiskText()
+        {
+            string path = TempState.PathOf(_dataDir);
+            for (int attempt = 0; attempt < 25; attempt++)
+            {
+                try
+                {
+                    using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                    using (var sr = new StreamReader(fs, Encoding.UTF8))
+                        return sr.ReadToEnd();
+                }
+                catch (FileNotFoundException) { return null; }
+                catch (DirectoryNotFoundException) { return null; }
+                catch (IOException) { System.Threading.Thread.Sleep(80); }
+            }
+            return null;
+        }
+
+        /// <summary>记录"我现在看到的文件内容"，免得自己刚写完又被自己当成外部改动重载一遍。</summary>
+        private void MarkDiskSeen()
+        {
+            try
+            {
+                string path = TempState.PathOf(_dataDir);
+                _diskSig = File.Exists(path) ? ContentHash.Of(ReadDiskText() ?? "") : null;
+            }
+            catch { _diskSig = null; }
         }
 
         // ------------------------------------------------------------------ 开始
@@ -195,9 +245,13 @@ namespace LabGuardServer.Core.Policy
             Materialize(t);
             Current = t;
             t.Save(_dataDir);
-            _diskStampUtc = StampNow();
+            MarkDiskSeen();
             Log.Info("已开始临时状态【" + t.Name + "】（" + t.RemainingText(nowUtc) + "，覆盖 " +
                      (1 + t.GroupEnvelopes.Count) + " 个目标，seq 至 " + t.MaxSeq + "）");
+            Auditor?.Write(Audit.AuditAction.TempStart, "classroom", t.Name, _store.CurrentSeq, t.MaxSeq,
+                "ok", null, "临时课堂状态开始：" + t.Name + "（" + t.RemainingText(nowUtc) +
+                "，覆盖 " + (1 + t.GroupEnvelopes.Count) + " 个目标）",
+                string.IsNullOrEmpty(startedBy) ? null : startedBy);
             return t;
         }
 
@@ -206,15 +260,23 @@ namespace LabGuardServer.Core.Policy
         /// <summary>人工结束：把被覆盖的目标改回基础策略（新 seq），并删掉临时状态文件。</summary>
         public bool End(string reason, DateTime nowUtc)
         {
+            return End(reason, nowUtc, Audit.AuditAction.TempEnd);
+        }
+
+        /// <summary>同 <see cref="End(string, DateTime)"/>，但可以指定审计动作名（人工结束 / 到期 / 重启丢弃）。</summary>
+        public bool End(string reason, DateTime nowUtc, string auditAction)
+        {
             if (Current == null) return false;
             TempState t = Current;
             Current = null;
             TempState.DeleteFile(_dataDir);
-            _diskStampUtc = DateTime.MinValue;
+            _diskSig = null;
             RepublishBase(t, reason);
             LastEndedName = t.Name;
             LastEndedReason = reason;
             LastEndedAtUtc = nowUtc;
+            Auditor?.Write(auditAction, "classroom", t.Name, t.MaxSeq, _store.CurrentSeq, "ok", null,
+                "临时课堂状态结束（" + reason + "）→ 已把被覆盖的目标改回基础策略", "系统");
             return true;
         }
 
@@ -223,7 +285,7 @@ namespace LabGuardServer.Core.Policy
         {
             if (Current == null || !Current.IsExpiredAt(nowUtc)) return false;
             Log.Info("临时状态【" + Current.Name + "】已到期 → 自动恢复基础策略");
-            return End("到期自动恢复", nowUtc);
+            return End("到期自动恢复", nowUtc, Audit.AuditAction.TempExpire);
         }
 
         // ------------------------------------------------------------------ 基础策略变了 → 重算临时信封
@@ -237,7 +299,7 @@ namespace LabGuardServer.Core.Policy
             if (Current == null) return false;
             Materialize(Current);
             Current.Save(_dataDir);
-            _diskStampUtc = StampNow();
+            MarkDiskSeen();
             Log.Info("基础策略已变更，已按新基础重算临时状态【" + Current.Name + "】的信封（seq 至 " +
                      Current.MaxSeq + "）：" + reason);
             return true;
@@ -338,17 +400,6 @@ namespace LabGuardServer.Core.Policy
                 Log.Error("临时状态（" + phase + "）校验异常，拒绝采用", ex);
                 return false;
             }
-        }
-
-        /// <summary>临时状态文件当前的时间戳（用于"自己写的别当成外部改动再拾取一遍"）。</summary>
-        private DateTime StampNow()
-        {
-            try
-            {
-                string path = TempState.PathOf(_dataDir);
-                return File.Exists(path) ? File.GetLastWriteTimeUtc(path) : DateTime.MinValue;
-            }
-            catch { return DateTime.MinValue; }
         }
 
         /// <summary>

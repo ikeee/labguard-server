@@ -21,6 +21,7 @@ namespace LabGuardServer
         private NotifyIcon _tray;
         private GroupStore _groups;
         private TempStateManager _temp;
+        private LabGuardServer.Core.Audit.AuditLog _audit;
         private System.Windows.Forms.Timer _tempWatch;
         private ToolStripMenuItem _tempMenu;
         private List<TempPreset> _presets = new List<TempPreset>();
@@ -78,8 +79,16 @@ namespace LabGuardServer
             _api = new ApiServer(_store, new OnlineList());
             _api.Groups = _groups;      // v0.11：/api/version 与 /api/policy 按设备身份解析分组
 
+            // v0.14 审计日志（LG-107）：链密钥由服务端私钥派生（不落盘），先轮转再记"服务启动"
+            _audit = new LabGuardServer.Core.Audit.AuditLog(Program.DataDir, LabGuardServer.Core.Audit.AuditLog.DeriveKey(_keys));
+            _audit.Rotate();
+            if (_keys.WasCreated)
+                _audit.Write(LabGuardServer.Core.Audit.AuditAction.KeyCreate, "key", "server-key", 0, 0, "ok", null,
+                    "首次部署：生成了新的签名密钥（公钥指纹 " + _keys.Fingerprint + "）");
+
             // v0.12 临时课堂状态层：启动即装载（已过期的会被丢弃并把基础策略重发一次）
             _temp = new TempStateManager(Program.DataDir, _keys, _store, _groups);
+            _temp.Auditor = _audit;
             _temp.Load(DateTime.UtcNow);
             _temp.StartWatching();
             _api.Temp = _temp;
@@ -97,6 +106,9 @@ namespace LabGuardServer
             else
             {
                 Log.Info("API 监听：" + _api.BoundPrefix);
+                _audit.Write(LabGuardServer.Core.Audit.AuditAction.ServerStart, "server", "tray",
+                    0, _store.CurrentSeq, "ok", null,
+                    "教师机服务端启动（托盘模式，监听 " + _api.BoundPrefix + "，当前策略 seq=" + _store.CurrentSeq + "）");
             }
 
             BuildTray();
@@ -195,17 +207,28 @@ namespace LabGuardServer
         /// <summary>给某个组签发并落盘策略（策略面板的「下发目标」用它）。</summary>
         internal ulong PublishToGroup(DeviceGroup group, System.Collections.Generic.Dictionary<string, object> policy, bool paused)
         {
+            ulong prevSeq = group.Seq;
+            System.Collections.Generic.Dictionary<string, object> oldGroupPolicy = null;
+            if (!string.IsNullOrEmpty(group.Envelope))
+            {
+                EnvelopeData oldEnv = PolicyEnvelope.Parse(group.Envelope, _keys.Rsa);
+                if (oldEnv.Verified) oldGroupPolicy = Json.ParseObject(oldEnv.PolicyJson);
+            }
             ulong seq = GroupPublisher.Publish(_keys, group, policy, paused,
                 () => _store.RefreshWatermark(), s => _store.MarkPublished(s));
             _groups.Save();
             // 分组策略变了 → 若正在临时状态中，按新基础重算临时信封（否则临时层停在旧基础上）
             _temp?.RefreshIfActive("分组策略更新：" + group.Name);
+            _audit?.Write(LabGuardServer.Core.Audit.AuditAction.PolicyPublish, "group", group.Name, prevSeq, seq,
+                "ok", null, "下发分组策略（成员 " + (group.DeviceIds.Count + group.Machines.Count) + " 台）：" +
+                LabGuardServer.Core.Audit.AuditSummary.PolicyChanges(oldGroupPolicy, policy, _catalog?.Fields));
             return seq;
         }
         private void BuildTray()
         {
             var menu = new ContextMenuStrip();
             menu.Items.Add("策略面板（需密码）", null, (s, e) => OpenPolicyForm());
+            menu.Items.Add("审计日志…（只读）", null, (s, e) => OpenAuditForm());
             menu.Items.Add("在线学生机", null, (s, e) => OpenOnlineForm());
             menu.Items.Add("设备分组…", null, (s, e) => OpenGroupsForm());
             _tempMenu = new ToolStripMenuItem("临时课堂状态");
@@ -293,7 +316,11 @@ namespace LabGuardServer
             if (_policyForm == null || _policyForm.IsDisposed)
             {
                 _policyForm = new PolicyForm(_store, _catalog, _api, _groups, PublishToGroup, OpenGroupsForm,
-                                             _temp, StartTempState);
+                                             _temp, StartTempState, _audit);
+                // 本产品策略面板是**免密**的（v0.10.1 产品决定）→ 没有"登录"事件可记；
+                // 记"面板被打开"以便追溯"谁在什么时候动过策略"（执行计划 §G1 的对应口径，已写进部署指南）。
+                _audit?.Write(LabGuardServer.Core.Audit.AuditAction.PanelOpen, "panel", "policy", 0, _store.CurrentSeq,
+                    "ok", null, "打开策略面板（免密面板：本产品没有登录流程，用它追溯管理动作的起点）");
                 _policyForm.Show();
             }
             else
@@ -303,6 +330,17 @@ namespace LabGuardServer
         }
 
         private OnlineForm _onlineForm;
+        private AuditForm _auditForm;
+        private void OpenAuditForm()
+        {
+            if (_auditForm == null || _auditForm.IsDisposed)
+            {
+                _auditForm = new AuditForm(_audit);
+                _auditForm.Show();
+            }
+            else _auditForm.Activate();
+        }
+
         private void OpenOnlineForm()
         {
             if (_onlineForm == null || _onlineForm.IsDisposed)
@@ -345,6 +383,13 @@ namespace LabGuardServer
 
         protected override void ExitThreadCore()
         {
+            try
+            {
+                _audit?.Write(LabGuardServer.Core.Audit.AuditAction.ServerStop, "server", "tray", 0, _store?.CurrentSeq ?? 0,
+                    "ok", null, "教师机服务端停止（托盘模式，由老师退出程序）");
+                _audit?.Rotate();
+            }
+            catch { }
             _api?.Stop();
             _keys?.Dispose();
             if (_tray != null) _tray.Visible = false;

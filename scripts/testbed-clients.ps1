@@ -390,6 +390,20 @@ Check '课堂⑤ 捣蛋那台的「整改组」严管策略仍然保留（分组
     ((Cached-Policy $clientDirs[$Clients - 1]).Contains('"DisableRegistryTools":true'))
 Ledger '00:40' '下课' '点 1 下：结束临时状态' $Clients ([math]::Round($sw3.Elapsed.TotalSeconds, 1).ToString() + 's')
 
+# ---- ⑥ 老师忘了点"结束"：到点自动回基础策略（这才是"到期"存在的理由）
+Say '  [00:45] 老师下课直接走了，没点"结束"——临时状态 5 秒后到点，服务端自动恢复基础策略'
+& $srvExe --data-dir $srvDir --temp-preset '上课模式' --temp-seconds 5 | Out-Null
+$autoBack = $false
+$deadline = (Get-Date).AddSeconds(40)
+while ((Get-Date) -lt $deadline) {
+    $all = $true
+    foreach ($d in $clientDirs) { if ((Cached-Policy $d).Contains('"StartDelaySeconds":4101')) { $all = $false } }
+    if ($all) { $autoBack = $true; break }
+    Start-Sleep -Milliseconds 300
+}
+Check '课堂⑥ 老师没点结束 → 到点**自动**回基础策略（不需要老师记得）' $autoBack
+Ledger '00:45' '老师忘点结束' '不需要动作：到点自动恢复' $Clients '自动'
+
 Say ''
 Say '  ---- 这节课的"老师动作账本" ----'
 $classLedger | ForEach-Object {
@@ -432,7 +446,8 @@ Check 'S8 教师端不可达 → 回退单机（FallbackSingle），已应用策
 
 Say '=== 教师端恢复 → 学生端自动回到 Polling ==='
 $srvProc2 = Start-Process -FilePath $srvExe -WindowStyle Hidden -PassThru `
-    -ArgumentList @('--headless', '--data-dir', $srvDir, '--port', "$Port", '--seconds', '110') `
+    -ArgumentList @('--headless', '--data-dir', $srvDir, '--port', "$Port", '--seconds', '110',
+                    '--export-devices', (Join-Path $root 'devices.csv')) `
     -RedirectStandardOutput (Join-Path $root 'server2-out.log') -RedirectStandardError (Join-Path $root 'server2-err.log')
 $back = Wait-State $clientDirs[0] { param($st) $st.linkState -eq 'Polling' } 60
 Check 'S8 教师端恢复 → 学生端自动回到 Polling（无需人工干预）' ($back -and $back.linkState -eq 'Polling')
@@ -450,7 +465,9 @@ $cloneProc = Start-Process -FilePath $svcExe -WindowStyle Hidden -PassThru `
 Start-Sleep -Seconds 20
 
 Say '=== 收尾：让教师端自然退出并打印设备清单（含状态/所属组）——**先别停学生端**，否则清单是空的 ==='
-$srvLeft = 110 - [int]((Get-Date) - $srvProc2.StartTime).TotalSeconds
+# 分两步算：`110 - [int](...).TotalSeconds` 在 PS 5.1 里可能把整个 TimeSpan 拿去 [int]，报 op_Subtraction 无重载
+$srvElapsed = ((Get-Date) - $srvProc2.StartTime).TotalSeconds
+$srvLeft = 110 - [int]$srvElapsed
 if ($srvLeft -gt 0) { Start-Sleep -Seconds ($srvLeft + 3) }
 foreach ($p in ($procs + $cloneProc)) { try { if ($p -and -not $p.HasExited) { $p | Stop-Process -Force } } catch { } }
 $listing = ''
@@ -468,6 +485,34 @@ Check 'S9 设备清单出现「应用失败」标注（S7 那台机器）' ($lis
     ((($listing -split "`n") | Where-Object { $_ -match 'status=error' } | Select-Object -First 2) -join ' | ')
 Check 'S9 设备清单出现按组归属（机房A / 机房B / 机房C 至少一个）' `
     (($listing -match 'group=机房A') -or ($listing -match 'group=机房B') -or ($listing -match 'group=机房C'))
+
+# ---------------------------------------------------------------- S11 审计：这一整套动作都留痕了吗
+Say '=== S11 审计日志：这一节课的每个管理动作都要留痕，且链校验通过 ==='
+$auditOut = Join-Path $root 'audit-tail.txt'
+$auditCsvPath = Join-Path $root 'audit.csv'
+$devCsvPath = Join-Path $root 'devices.csv'
+Start-Process -FilePath $srvExe -WindowStyle Hidden -Wait -PassThru `
+    -ArgumentList @('--data-dir', $srvDir, '--audit-verify', '--audit-tail', '200',
+                    '--audit-export', $auditCsvPath, '--export-devices', $devCsvPath) `
+    -RedirectStandardOutput $auditOut -RedirectStandardError (Join-Path $root 'audit-err.txt') | Out-Null
+$auditText = Get-Content -LiteralPath $auditOut -Raw -Encoding UTF8
+Check 'S11 审计链校验通过（哈希链：删/改/调序都认得出）' ($auditText -match '审计链校验：通过') `
+    ((($auditText -split "`n") | Where-Object { $_ -match '审计链校验' }) -join ' ')
+$needAudit = @('server.start', 'policy.publish', 'temp.start', 'temp.expire', 'pairing.export')
+$missingAudit = @()
+foreach ($a in $needAudit) { if (-not ($auditText -match [regex]::Escape($a))) { $missingAudit += $a } }
+Check ('S11 关键动作全部留痕：' + ($needAudit -join ' / ')) ($missingAudit.Count -eq 0) ('缺：' + ($missingAudit -join ','))
+Check 'S11 审计里**不含**口令散列等机密（只写摘要）' `
+    (($auditText -notmatch 'pbkdf2') -and ($auditText -notmatch 'PasswordHash'))
+if (Test-Path -LiteralPath $auditCsvPath) {
+    $csvBytes = [System.IO.File]::ReadAllBytes($auditCsvPath)
+    $csvHead = [System.Text.Encoding]::UTF8.GetString($csvBytes, 0, [Math]::Min(400, $csvBytes.Length))
+    Check 'S11 审计 CSV：UTF-8 带 BOM（Excel 直接认中文）+ 含表头' `
+        (($csvBytes[0] -eq 0xEF -and $csvBytes[1] -eq 0xBB -and $csvBytes[2] -eq 0xBF) -and $csvHead.Contains('序号'))
+}
+else { Check 'S11 审计 CSV 已生成' $false '文件不存在' }
+Check 'S11 设备状态 CSV 已生成（含表头与已应用序号）' `
+    ((Test-Path -LiteralPath $devCsvPath) -and ((Get-Content -LiteralPath $devCsvPath -Raw -Encoding UTF8).Contains('已应用seq')))
 
 # ---------------------------------------------------------------- ④ 收尾断言：真机没被污染
 Say '=== ④ 收尾：真机状态复核（分组/暂停这些新动作也不许碰真机）==='

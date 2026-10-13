@@ -36,7 +36,8 @@ namespace LabGuardServer.Core.Policy
 
         private readonly object _sync = new object();
         private FileSystemWatcher _watcher;
-        private DateTime _diskStampUtc = DateTime.MinValue;
+        /// <summary>上次看到的 groups.json **内容签名**（不用时间戳：原子替换后时间戳不一定变新，实测会漏掉改动）。</summary>
+        private string _diskSig;
 
         /// <summary>数据目录（自检注入临时目录用）。</summary>
         public string DataDir { get; set; }
@@ -54,7 +55,7 @@ namespace LabGuardServer.Core.Policy
             lock (_sync)
             {
                 Groups = ReadFromDisk();
-                _diskStampUtc = StampOfDisk();
+                MarkDiskSeen();
             }
         }
 
@@ -105,21 +106,37 @@ namespace LabGuardServer.Core.Policy
                     if (!File.Exists(GroupsPath))
                     {
                         // 从没见过文件（比如自检里纯内存改的组、还没 Save）→ 什么都没变，**不能**把内存里的组清掉
-                        if (_diskStampUtc == DateTime.MinValue) return false;
-                        // 见过文件、现在没了 → 是外部删的，跟着回退到"无分组"
-                        Groups = new List<DeviceGroup>();
-                        _diskStampUtc = DateTime.MinValue;
-                        Log.Info("分组文件已不存在 → 全部设备回默认策略");
-                        return true;
+                        if (_diskSig == null) return false;
+                        // 见过文件、现在"没了"：**先别急着认定被删**。
+                        // AtomicFile 是"写临时文件 → 原子替换"，替换瞬间存在极短的文件消失窗口；
+                        // 恰好有请求落在这个窗口里，就会把"正在被重写"误判成"分组被删了"，
+                        // 于是内存里的组被清空 —— 后果是**整节课的分组归属全丢、全班都收到默认策略**
+                        // （v0.12 实测踩到：设备清单里所有机器都变成 group=默认策略）。
+                        // 所以重试几次，仍然没有才认定为"真被删了"。
+                        bool reappeared = false;
+                        for (int i = 0; i < 4 && !reappeared; i++)
+                        {
+                            System.Threading.Thread.Sleep(60);
+                            reappeared = File.Exists(GroupsPath);
+                        }
+                        if (!reappeared)
+                        {
+                            Groups = new List<DeviceGroup>();
+                            _diskSig = null;
+                            Log.Info("分组文件已不存在 → 全部设备回默认策略");
+                            return true;
+                        }
                     }
-                    // Windows 下文件系统事件常常早于写入者关闭文件：拿到时间戳也可能读到半截，
-                    // 所以这里既比时间戳、也给读取留退避重试（同 PolicyStore.ReadDiskEnvelope 的教训）。
-                    DateTime stamp = StampOfDisk();
-                    if (stamp == _diskStampUtc) return false;
-                    List<DeviceGroup> loaded = ReadFromDiskWithRetry();
+                    // 用**内容签名**判断变没变（不用时间戳：原子替换后时间戳不一定变新，实测会漏掉改动）。
+                    // 读取仍带退避重试：Windows 下文件系统事件常常早于写入者关闭文件，直读会读到半截。
+                    string text = ReadDiskText();
+                    if (text == null) return false;
+                    string sig = ContentHash.Of(text);
+                    if (sig == _diskSig) return false;
+                    List<DeviceGroup> loaded = ParseGroups(text);
                     if (loaded == null) return false;
                     Groups = loaded;
-                    _diskStampUtc = stamp;
+                    _diskSig = sig;
                     Log.Info("已拾取磁盘上的分组文件：" + Groups.Count + " 组");
                     return true;
                 }
@@ -131,10 +148,14 @@ namespace LabGuardServer.Core.Policy
             }
         }
 
-        private DateTime StampOfDisk()
+        /// <summary>记录"我现在看到的文件内容"，免得自己刚写完又被自己当成外部改动重载一遍。</summary>
+        private void MarkDiskSeen()
         {
-            try { return File.Exists(GroupsPath) ? File.GetLastWriteTimeUtc(GroupsPath) : DateTime.MinValue; }
-            catch { return DateTime.MinValue; }
+            try
+            {
+                _diskSig = File.Exists(GroupsPath) ? ContentHash.Of(ReadDiskText() ?? "") : null;
+            }
+            catch { _diskSig = null; }
         }
 
         private string ReadDiskText()
@@ -225,7 +246,7 @@ namespace LabGuardServer.Core.Policy
                         }).ToList() },
                 };
                 AtomicFile.WriteAllText(GroupsPath, new JavaScriptSerializer().Serialize(doc));
-                _diskStampUtc = StampOfDisk();     // 记下自己这次写的时间戳：免得马上又被自己的写入触发一次重载
+                MarkDiskSeen();     // 记下自己这次写的内容：免得马上又被自己的写入触发一次重载
             }
             catch (Exception ex)
             {

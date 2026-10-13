@@ -20,6 +20,9 @@ namespace LabGuardServer.Core.Envelope
         /// <summary>指纹：公钥 XML 的 SHA256 前 16 字节 hex。配对文件里给学生机人工核对用。</summary>
         public string Fingerprint { get; private set; }
 
+        /// <summary>本次是不是**新生成**了密钥（首次部署）。启动时用它决定要不要写审计：key.create。</summary>
+        public bool WasCreated { get; private set; }
+
         private RsaKeyStore(string dataDir, RSA rsa)
         {
             DataDir = dataDir;
@@ -32,8 +35,9 @@ namespace LabGuardServer.Core.Envelope
         {
             Directory.CreateDirectory(dataDir);
             string path = Path.Combine(dataDir, KeyFileName);
+            bool existedBefore = File.Exists(path);
             RSA rsa;
-            if (File.Exists(path))
+            if (existedBefore)
             {
                 byte[] blob = File.ReadAllBytes(path);
                 byte[] xmlBytes;
@@ -60,7 +64,7 @@ namespace LabGuardServer.Core.Envelope
             }
             if (rsa.KeySize < 2048)
                 throw new InvalidDataException("签名密钥低于 2048 位（实际 " + rsa.KeySize + "），拒绝使用");
-            return new RsaKeyStore(dataDir, rsa);
+            return new RsaKeyStore(dataDir, rsa) { WasCreated = !existedBefore };
         }
 
         /// <summary>公钥 XML（不含私钥）——配对文件导出用。</summary>
