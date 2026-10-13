@@ -113,8 +113,10 @@ $logText = Get-Content $log -Encoding UTF8 -Raw
 Check '14. 在线列表含 E2E-PS' ($logText -match 'E2E-PS') ("exit=" + $exitCode)
 # 注：PS 5.1 下 Start-Process -PassThru 的对象即使进程已退出，ExitCode 也常常读不到（本机实测），
 # 这里是**环境限制**而不是服务端问题；用"进程确实退出了 + 日志打印到最后一屏"来判正常收尾。
+# 末屏标题 v0.11.1 起从「在线学生机」改为「设备清单」（同一屏多了 dev=/applied=/state=/group= 字段），
+# 这里两种都认：脚本不该因为一句展示文案改名而误报"没打印完整屏"。
 $stillRunning = $null -ne (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue)
-Check '15. 服务端到点正常退出（日志打完整屏）' ((-not $stillRunning) -and ($logText -match '在线学生机')) `
+Check '15. 服务端到点正常退出（日志打完整屏）' ((-not $stillRunning) -and ($logText -match '设备清单|在线学生机')) `
     ("exit=" + $exitCode + " stillRunning=" + $stillRunning)
 
 Write-Host ''
