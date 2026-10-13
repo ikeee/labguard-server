@@ -9,6 +9,7 @@
 - 许可：MIT（见 [LICENSE](LICENSE)）· 更新记录：[CHANGELOG.md](CHANGELOG.md) · 通信协议：[docs/protocol-v1.md](docs/protocol-v1.md)
 - 开发文档：[开发基线](docs/development-baseline.md) · [协议实现对照审计](docs/protocol-conformance.md) · [接手开发执行计划](docs/development-plan.md)
 - 端到端测试台（**一台机器跑 1 个真教师端 + N 个真学生端沙箱**）：[docs/e2e-testbed.md](docs/e2e-testbed.md)
+- **课堂助教手册**（一节 40 分钟的课，老师只需动 5 次手）：[docs/classroom-playbook.md](docs/classroom-playbook.md)
 
 ## 是什么
 
@@ -82,6 +83,20 @@ powershell -File scripts\testbed-clients.ps1      # 21 项场景：真教师端 
 
 细节与场景矩阵见 [docs/e2e-testbed.md](docs/e2e-testbed.md)。**先跑安全闸**——沙箱没有真正隔离时，
 场景里的"学生端"会按真策略改掉开发机（2026-10-13 就是这么踩的）。
+
+### 临时课堂状态（v0.12：上课/严管/考试一键切，到点自动回基础策略）
+
+```bat
+LabGuardServer.exe --data-dir %ProgramData%\LabGuardServer --temp-status
+LabGuardServer.exe --data-dir %ProgramData%\LabGuardServer --temp-preset 课堂严管
+LabGuardServer.exe --data-dir %ProgramData%\LabGuardServer --temp-start D:\严管.json --temp-name 课堂严管 --temp-minutes 45
+LabGuardServer.exe --data-dir %ProgramData%\LabGuardServer --temp-end
+```
+
+预设表 `temp-presets.json` 在教师机数据目录里（**老师可直接编辑**）；`--temp-minutes 0` = 不自动到期。
+有效策略口径 `= (分组策略 或 默认策略) ⊕ 临时覆盖`，解析优先级 **临时 > 分组 > 默认**；
+到期/结束后服务端把基础策略**重签一个新 seq** 下发（否则学生机按防回滚拒收、永久卡住）。
+老师怎么用、每个"学生招数"对应哪个开关、以及做不到的清单，见 [docs/classroom-playbook.md](docs/classroom-playbook.md)。
 
 协议端到端冒烟（会自己起服务端、用**独立实现**核对 15 项契约、检查完自动收尾）：
 

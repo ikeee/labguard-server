@@ -247,6 +247,147 @@ Check 'S6 全员恢复信封（paused=0）' $resumedOk
 Check 'S6 发布过分组策略后仍能加载/改写默认策略（全局水位与默认组水位分离的回归点）' `
     ($pausedOk -and $resumedOk)
 
+# ================================================================ 课堂演练：模拟一节 40 分钟的课
+# 口径（重要，别夸大）：这里的"学生捣蛋"是**按真实事件写成台词**，本演练验证的是
+#   「老师 1 次动作 → 全班 N 台在 X 秒内换成正确的开关组合（含分组隔离）」这条链路与耗时；
+#   真正的"游戏进程被拦、Win+Tab 被屏蔽"由**学生机上的 Guard**执行（沙箱是干跑模式，只发策略不动系统）。
+Say ''
+Say '=== 课堂演练：一节 40 分钟的课（压缩成几分钟跑；学生台词是模拟的，链路与耗时是真的）==='
+$classLedger = New-Object System.Collections.ArrayList
+
+function Start-ClassPreset([string]$name) {
+    & $srvExe --data-dir $srvDir --temp-preset $name | Out-Null
+}
+function Wait-AllCached([string]$needle, [int]$timeoutSec = 20) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        $all = $true
+        foreach ($d in $clientDirs) { if (-not (Cached-Policy $d).Contains($needle)) { $all = $false; break } }
+        if ($all) { $sw.Stop(); return $sw.Elapsed.TotalSeconds }
+        Start-Sleep -Milliseconds 200
+    }
+    $sw.Stop()
+    return -1
+}
+function Ledger([string]$wn, [string]$ev, [string]$act, [int]$mac, [string]$took) {
+    [void]$classLedger.Add([pscustomobject]@{ when = $wn; event = $ev; action = $act; machines = $mac; took = $took })
+}
+
+# 老师的"一键预设"= 机房自己的 temp-presets.json（托盘菜单里就是这么列出来的）
+$presets = @'
+{"schemaVersion":1,"presets":[
+ {"name":"上课模式","description":"正常上课：锁 U 盘存储、放开浏览器（查资料）","durationMinutes":45,
+  "patch":{"StartDelaySeconds":4101,"Usb":{"Enabled":true,"AllowStorage":false},"Browser":{"Enabled":false},"ProcessBlock":{"Enabled":false}}},
+ {"name":"课堂严管","description":"有人打外网游戏：启用违规软件拦截 + 集中 DNS + 收浏览器小游戏","durationMinutes":45,
+  "patch":{"StartDelaySeconds":4202,"ProcessBlock":{"Enabled":true,"BlockGames":true,"BlockVirtualDesktop":true},
+           "Browser":{"Enabled":true,"BlockDownloads":true,"BlockChromeDino":true,"BlockEdgeSurf":true},
+           "Network":{"EnforceDns":true,"BlockDoh":true},"Usb":{"Enabled":true,"AllowStorage":false}}},
+ {"name":"课堂严管+桌面防逃","description":"有人多开桌面逃管制：再屏蔽 Win 键/任务视图/任务管理器","durationMinutes":45,
+  "patch":{"StartDelaySeconds":4303,"ProcessBlock":{"Enabled":true,"BlockGames":true,"BlockVirtualDesktop":true,"BlockTaskManager":true,"BlockCommandPrompt":true},
+           "Shell":{"Enabled":true,"HideTaskView":true,"BlockWindowsKey":true,"DisableTaskManager":true,"DisableCmd":true},
+           "Browser":{"Enabled":true,"BlockDownloads":true,"BlockChromeDino":true,"BlockEdgeSurf":true},
+           "Network":{"EnforceDns":true,"BlockDoh":true},"Usb":{"Enabled":true,"AllowStorage":false}}},
+ {"name":"全班暂停（讲评）","description":"老师要讲评，全班先停下来","durationMinutes":10,"paused":true,"patch":{}}
+]}
+'@
+[System.IO.File]::WriteAllText((Join-Path $srvDir 'temp-presets.json'), $presets, (New-Object System.Text.UTF8Encoding($false)))
+
+# ---- ① 上课铃：老师点一下「上课模式」
+Say '  [00:00] 上课铃。老师：点 1 下「上课模式」（托盘 → 临时课堂状态 → 上课模式）'
+Start-ClassPreset '上课模式'
+$took = Wait-AllCached '"StartDelaySeconds":4101'
+Check ('课堂① 一键「上课模式」→ 全班 ' + $Clients + ' 台在 ' + [math]::Round($took, 1) + ' 秒内换到上课策略') ($took -ge 0)
+Ledger '00:00' '上课铃' '点 1 下：上课模式' $Clients ([math]::Round($took, 1).ToString() + 's')
+
+# ---- ② 有人打外网游戏
+Say '  [00:08] 学生A：开浏览器打在线小游戏；学生B：插 U 盘想拷游戏进来'
+Say '           老师：还是 1 下 —— 换「课堂严管」（拦小游戏 + 集中 DNS + 收浏览器）'
+$sw = [Diagnostics.Stopwatch]::StartNew()
+Start-ClassPreset '课堂严管'
+$took = Wait-AllCached '"StartDelaySeconds":4202'
+$okGames = $true
+foreach ($d in $clientDirs) {
+    $c = Cached-Policy $d
+    if (-not $c.Contains('"BlockGames":true') -or -not $c.Contains('"BlockDoh":true')) { $okGames = $false }
+}
+Check ('课堂② 「课堂严管」全班生效（' + [math]::Round($took, 1) + 's），且信封里确实带上了 BlockGames / BlockDoh') `
+    (($took -ge 0) -and $okGames)
+Ledger '00:08' '打外网游戏 + 插 U 盘' '点 1 下：课堂严管' $Clients ([math]::Round($took, 1).ToString() + 's')
+
+# ---- ③ 有人多开桌面想逃管制
+Say '  [00:15] 学生C：按 Win+Tab 开虚拟桌面，把游戏窗口藏到第二个桌面'
+Say '           老师：还是 1 下 —— 换「课堂严管+桌面防逃」（屏蔽 Win 键/任务视图 + 拦虚拟桌面软件）'
+Start-ClassPreset '课堂严管+桌面防逃'
+$took = Wait-AllCached '"StartDelaySeconds":4303'
+$okEscape = $true
+foreach ($d in $clientDirs) {
+    $c = Cached-Policy $d
+    if (-not $c.Contains('"BlockWindowsKey":true') -or -not $c.Contains('"HideTaskView":true') -or
+        -not $c.Contains('"BlockVirtualDesktop":true')) { $okEscape = $false }
+}
+Check ('课堂③ 桌面防逃开关全班到位（' + [math]::Round($took, 1) + 's）：BlockWindowsKey + HideTaskView + BlockVirtualDesktop') `
+    (($took -ge 0) -and $okEscape)
+Ledger '00:15' '多开桌面逃管制' '点 1 下：课堂严管+桌面防逃' $Clients ([math]::Round($took, 1).ToString() + 's')
+
+# ---- ④ 个别人继续破坏电脑：只处理他，不牵连全班（分组 + 临时层自动重算）
+Say '  [00:22] 学生C 继续折腾：改注册表、开任务管理器、cmd 里删文件（就这 1 台）'
+Say '           老师：还是 1 下 —— 把这一台划进「整改组」并只给它下发更严的组策略（其余人继续上课）'
+$remedy = '{"StartDelaySeconds":4404,"Usb":{"Enabled":true,"AllowStorage":false},' +
+          '"Browser":{"Enabled":true,"BlockDownloads":true},' +
+          '"ProcessBlock":{"Enabled":true,"BlockTaskManager":true,"BlockCommandPrompt":true,"BlockRegedit":true},' +
+          '"Shell":{"Enabled":true,"DisableTaskManager":true,"DisableCmd":true,"DisableRegistryTools":true}}'
+$remedyPath = Join-Path $root 'class-remedy.json'
+[System.IO.File]::WriteAllText($remedyPath, $remedy, (New-Object System.Text.UTF8Encoding($false)))
+$badOne = $deviceIds[$Clients - 1]                      # 最后那台 = 捣蛋的那台
+& $srvExe --data-dir $srvDir --add-group '整改组' --assign ('整改组=' + $badOne) `
+    --group-policy ('整改组=' + $remedyPath) | Out-Null
+$sw2 = [Diagnostics.Stopwatch]::StartNew()
+$okRemedy = $false
+$deadline = (Get-Date).AddSeconds(25)
+while ((Get-Date) -lt $deadline) {
+    $c = Cached-Policy $clientDirs[$Clients - 1]
+    # 那台机 = 自己的更严基础（DisableRegistryTools）⊕ 全班临时覆盖（4303）——两条同时在
+    if ($c.Contains('"DisableRegistryTools":true') -and $c.Contains('"StartDelaySeconds":4303')) { $okRemedy = $true; break }
+    Start-Sleep -Milliseconds 200
+}
+$sw2.Stop()
+Check ('课堂④ 只对捣蛋那 1 台加严：它同时拿到「整改组策略 ⊕ 全班临时覆盖」（' +
+       [math]::Round($sw2.Elapsed.TotalSeconds, 1) + 's），其余机器不受影响') $okRemedy
+$othersClean = $true
+foreach ($d in $clientDirs[0..($Clients - 2)]) {
+    if ((Cached-Policy $d).Contains('"DisableRegistryTools":true')) { $othersClean = $false }
+}
+Check '课堂④ 其他同学**完全不受影响**（分组隔离）' $othersClean
+Ledger '00:22' '个别人破坏电脑' '点 1 下：划进整改组 + 只发那 1 台' 1 ([math]::Round($sw2.Elapsed.TotalSeconds, 1).ToString() + 's')
+
+# ---- ⑤ 下课：结束临时状态 → 全班自动回基础策略
+Say '  [00:40] 下课。老师：1 下「结束临时状态」→ 全班回到基础策略（不用逐项改回来）'
+& $srvExe --data-dir $srvDir --temp-end | Out-Null
+$sw3 = [Diagnostics.Stopwatch]::StartNew()
+$backBase = $false
+$deadline = (Get-Date).AddSeconds(25)
+while ((Get-Date) -lt $deadline) {
+    $all = $true
+    foreach ($d in $clientDirs) { if ((Cached-Policy $d).Contains('"StartDelaySeconds":4303')) { $all = $false } }
+    if ($all) { $backBase = $true; break }
+    Start-Sleep -Milliseconds 200
+}
+$sw3.Stop()
+Check ('课堂⑤ 一下课全班自动脱离课堂状态（' + [math]::Round($sw3.Elapsed.TotalSeconds, 1) + 's，无需老师逐项改回）') $backBase
+Check '课堂⑤ 捣蛋那台的「整改组」严管策略仍然保留（分组基础没有被课堂状态覆盖掉）' `
+    ((Cached-Policy $clientDirs[$Clients - 1]).Contains('"DisableRegistryTools":true'))
+Ledger '00:40' '下课' '点 1 下：结束临时状态' $Clients ([math]::Round($sw3.Elapsed.TotalSeconds, 1).ToString() + 's')
+
+Say ''
+Say '  ---- 这节课的"老师动作账本" ----'
+$classLedger | ForEach-Object {
+    Say ('   ' + $_.when.PadRight(6) + ' ' + $_.event.PadRight(22) + ' | ' + $_.action.PadRight(30) +
+         ' | 涉及 ' + $_.machines + ' 台 | 生效 ' + $_.took)
+}
+Say ('   合计：' + $classLedger.Count + ' 次动作处理 ' + $classLedger.Count + ' 个课堂事件；' +
+     '同等效果下"老师逐个机位跑"= 至少 ' + ($Clients * $classLedger.Count) + ' 次到场操作')
+
 # ---------------------------------------------------------------- S7 应用失败上报
 Say '=== 应用失败上报：把某台沙箱的 config.json 设为只读，再逼它应用新策略 ==='
 $failDir = $clientDirs[1]

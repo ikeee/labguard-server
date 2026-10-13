@@ -622,6 +622,168 @@ namespace LabGuardServer.SelfTest
                 Check(groupsReloaded.Resolve("LG-aaaa000011112222", "PC-101") == null, "11.11 删组后设备回到默认策略");
                 Check(groupsReloaded.GroupNameOf("LG-aaaa000011112222", "PC-101") == GroupStore.DefaultGroupName,
                     "11.11 组名显示回落为「" + GroupStore.DefaultGroupName + "」");
+
+                // ================================================================ [12] 临时课堂状态层（v0.12）
+                // 有效策略 = 基础策略 ⊕ 临时覆盖；覆盖在**发布时**合成、照旧签名 + 排 seq 下发（客户端零改动）。
+                // 三件事必须成立：合并规则确定可测、三层解析（临时 > 分组 > 默认）、到期/重启都能可靠回到基础策略。
+                Console.WriteLine("[12] 临时课堂状态层（合并规则 / 三层解析 / 到期恢复 / 重启不残留）");
+                // 用独立作用域包起来：这一节的临时变量名（t1/mgr/…）不必和外层的重名（外层同名变量会遮蔽，
+                // 是本文件的老毛病之一——加一层 {} 最省事也最不容易出错）
+                {
+
+                // ---- 合并规则（纯函数，先钉死语义再谈编排）
+                var mBase = Json.ParseObject("{\"A\":{\"x\":1,\"y\":2},\"B\":[1,2,3],\"C\":\"keep\",\"D\":false}");
+                string mBaseDump = PolicyMerge.Dump(mBase);
+                var mMerged = PolicyMerge.Merge(mBase, Json.ParseObject("{\"A\":{\"y\":9},\"B\":[7],\"E\":\"new\"}"));
+                Check(Convert.ToInt32(PathAccess.Get(mMerged, "A.x")) == 1 &&
+                      Convert.ToInt32(PathAccess.Get(mMerged, "A.y")) == 9,
+                    "12.1 对象递归合并：只改补丁里出现的键（A.x 保持 1、A.y 变 9）");
+                // 数组元素类型随序列化器不同（object[] / ArrayList），这里比"规范化摘要"最稳
+                Check(PolicyMerge.Dump(PathAccess.Get(mMerged, "B")) == "[7]",
+                    "12.2 数组**整体替换**而不是追加（能临时『只放行 3 个进程』）",
+                    PolicyMerge.Dump(PathAccess.Get(mMerged, "B")));
+                Check((string)PathAccess.Get(mMerged, "C") == "keep" && Equals(PathAccess.Get(mMerged, "D"), false) &&
+                      (string)PathAccess.Get(mMerged, "E") == "new",
+                    "12.3 补丁没提到的键一个都不动；补丁新增的键被加入");
+                Check(PolicyMerge.Dump(PolicyMerge.Merge(mBase, new Dictionary<string, object>())) == mBaseDump,
+                    "12.4 空补丁 = base 原样（『恢复/回槽』语义的地基）");
+                Check(PolicyMerge.Dump(mBase) == mBaseDump,
+                    "12.5 合并不修改入参（base 摘要不变，别把面板底稿改脏）");
+                string dump1 = PolicyMerge.Dump(PolicyMerge.Merge(mBase, Json.ParseObject("{\"A\":{\"y\":9},\"E\":\"new\",\"B\":[7]}")));
+                string dump2 = PolicyMerge.Dump(PolicyMerge.Merge(mBase, Json.ParseObject("{\"B\":[7],\"E\":\"new\",\"A\":{\"y\":9}}")));
+                Check(dump1 == dump2, "12.6 确定性：补丁键顺序不同 → 合并结果完全一致");
+
+                // ---- 落地测试环境：一个带分组的策略仓库
+                string tdir = Path.Combine(tmp, "v12temp");
+                Directory.CreateDirectory(tdir);
+                var tStore = new PolicyStore(tdir, keys);
+                tStore.Load();
+                var tGroups = new GroupStore(tdir);
+                tGroups.Load();
+                Dictionary<string, object> tPolicy = Json.ParseObject(catalog.DefaultPolicyJson);
+                tStore.Save(tPolicy, false, catalog.DefaultPolicyJson);                       // 默认组 seq=1
+                DeviceGroup tGx = tGroups.Add("机房X");
+                var tPolicyX = Json.ParseObject(catalog.DefaultPolicyJson);
+                PathAccess.Set(tPolicyX, "StartDelaySeconds", 777);
+                GroupPublisher.Publish(keys, tGx, tPolicyX, false, () => tStore.RefreshWatermark(), s => tStore.MarkPublished(s));
+                tGroups.Assign(tGx.Id, "LG-inside-group", "PC-X");
+                tGroups.Save();
+
+                var mgr = new TempStateManager(tdir, keys, tStore, tGroups);
+                mgr.Load(DateTime.UtcNow);
+                Check(!mgr.Active, "12.7 没有临时状态文件 → Active=false（与 v0.11 行为一致）");
+
+                var presetList = TempPresets.Load(tdir);
+                Check(presetList.Count >= 3 && File.Exists(TempPresets.PathOf(tdir)),
+                    "12.8 预设表缺失 → 自动落一份内置示例（3 个，老师可直接编辑）");
+                Check(TempPresets.Find(presetList, "考试模式") != null && TempPresets.Find(presetList, "不存在") == null,
+                    "12.8 预设按名字命中（找不到返回 null）");
+                Check(TempPresets.Find(presetList, "全员暂停")?.Paused == true,
+                    "12.8 预设可以带『全员暂停』（patch 为空也算一个有效的临时状态）");
+
+                TempState v12t1 = mgr.Start("考试模式", "{\"Usb\":{\"Enabled\":true,\"AllowStorage\":false}}", false, null,
+                    "自检", DateTime.UtcNow);
+                Check(v12t1.DefaultEnvelope != null && v12t1.GroupEnvelopes.ContainsKey(tGx.Id),
+                    "12.9 开始临时状态：默认组 + 每个已下发分组的信封都签好了");
+                Check(PolicyEnvelope.ParseHeader(v12t1.DefaultEnvelope).Seq > tStore.Version().Seq,
+                    "12.9 临时信封 seq 严格大于基础信封（否则学生机按防回滚拒收）");
+
+                // ---- 三层解析：临时 > 分组 > 默认
+                Check(ApiServer.GetPolicy(tStore, tGroups, mgr, "LG-nobody", "PC-9").Body == v12t1.DefaultEnvelope,
+                    "12.10 未命中分组的设备 → 拿默认组的临时信封");
+                Check(ApiServer.GetPolicy(tStore, tGroups, mgr, "LG-inside-group", "PC-X").Body == v12t1.GroupEnvelopes[tGx.Id],
+                    "12.10 组内设备 → 拿『该组自己的基础策略 ⊕ 同一份临时覆盖』（不是默认组那份）");
+                var tGxEnv = PolicyEnvelope.Parse(v12t1.GroupEnvelopes[tGx.Id], keys.Rsa);
+                var tGxJson = Json.ParseObject(tGxEnv.PolicyJson);
+                Check(tGxEnv.Verified && Convert.ToInt32(PathAccess.Get(tGxJson, "StartDelaySeconds")) == 777 &&
+                      Equals(PathAccess.Get(tGxJson, "Usb.AllowStorage"), false),
+                    "12.10 组临时信封的内容核对：保留了本组的 777，也应用了临时覆盖的 AllowStorage=false");
+
+                // ---- 到期 → 自动恢复基础策略
+                TempState v12t2 = mgr.Start("考试模式（会到期）", "{\"StartDelaySeconds\":3333}", false,
+                    DateTime.UtcNow.AddSeconds(1), "自检", DateTime.UtcNow);
+                bool expired = false;
+                for (int i = 0; i < 40 && !expired; i++)
+                {
+                    System.Threading.Thread.Sleep(200);
+                    expired = mgr.ExpireIfDue(DateTime.UtcNow);
+                }
+                Check(expired && !mgr.Active, "12.11 到点自动结束（ExpireIfDue=true、Active=false）");
+                Check(!File.Exists(TempState.PathOf(tdir)), "12.11 临时状态文件已删除（不留幽灵覆盖）");
+                var tBase = PolicyEnvelope.Parse(tStore.CurrentEnvelope, keys.Rsa);
+                Check(tBase.Verified && !tBase.PolicyJson.Contains("3333") && tBase.Seq > v12t2.MaxSeq,
+                    "12.11 默认组回到基础策略：内容不含临时改动，且 seq 比临时状态更高（学生机才会离开临时策略）");
+                var tGxBase = PolicyEnvelope.Parse(tGroups.Get(tGx.Id).Envelope, keys.Rsa);
+                Check(Convert.ToInt32(PathAccess.Get(Json.ParseObject(tGxBase.PolicyJson), "StartDelaySeconds")) == 777 &&
+                      tGxBase.Seq > v12t2.MaxSeq,
+                    "12.11 分组也回到自己的基础策略（777 保留），seq 同样前进");
+
+                // ---- 临时暂停：paused 位在临时状态里叠加、结束后回落
+                TempState v12t3 = mgr.Start("临时全员暂停", "{}", true, null, "自检", DateTime.UtcNow);
+                Check(PolicyEnvelope.ParseHeader(v12t3.DefaultEnvelope).Paused,
+                    "12.12 临时状态可以带『全员暂停』（信封 paused=1）");
+                mgr.End("自检结束", DateTime.UtcNow);
+                Check(!PolicyEnvelope.ParseHeader(tStore.CurrentEnvelope).Paused &&
+                      !File.Exists(TempState.PathOf(tdir)),
+                    "12.12 人工结束后 paused 回到基础值（0），临时文件删除");
+
+                // ---- 服务端重启：不允许"睡一觉还在考试模式"
+                TempState v12t4 = mgr.Start("昨晚的考试模式", "{\"StartDelaySeconds\":4444}", false,
+                    DateTime.UtcNow.AddSeconds(1), "自检", DateTime.UtcNow);
+                var restarted = new TempStateManager(tdir, keys, tStore, tGroups);
+                restarted.Load(DateTime.UtcNow.AddSeconds(3));      // "重启"发生在过期之后
+                Check(!restarted.Active && !File.Exists(TempState.PathOf(tdir)),
+                    "12.13 重启时发现已过期 → 直接丢弃（Active=false、文件已删）");
+                Check(tStore.Version().Seq > v12t4.MaxSeq,
+                    "12.13 并且把基础策略重发了一次（新 seq）——否则学生机会永久卡在临时策略上");
+
+                // ---- 基础策略在临时状态期间被改：临时层必须按新基础重算
+                TempState v12t5 = mgr.Start("考试模式", "{\"StartDelaySeconds\":5555}", false, null, "自检", DateTime.UtcNow);
+                ulong beforeRefresh = v12t5.MaxSeq;
+                var tNewBase = Json.ParseObject(catalog.DefaultPolicyJson);
+                PathAccess.Set(tNewBase, "StartDelaySeconds", 888);
+                tStore.Save(tNewBase, false, null);
+                mgr.RefreshIfActive("自检：基础策略变了");
+                var tAfter = PolicyEnvelope.Parse(mgr.Current.DefaultEnvelope, keys.Rsa);
+                Check(Convert.ToInt32(PathAccess.Get(Json.ParseObject(tAfter.PolicyJson), "StartDelaySeconds")) == 5555 &&
+                      mgr.Current.MaxSeq > beforeRefresh,
+                    "12.14 临时状态跟随新基础重算（覆盖仍是 5555、seq 前进）");
+                mgr.End("自检结束", DateTime.UtcNow);
+                Check(Convert.ToInt32(PathAccess.Get(Json.ParseObject(PolicyEnvelope.Parse(tStore.CurrentEnvelope, keys.Rsa).PolicyJson),
+                        "StartDelaySeconds")) == 888,
+                    "12.14 结束后回到的是**新**基础策略（888），不是开临时状态时的旧基础");
+
+                // ---- 覆盖范围口径：临时状态期间新建的组，**刷新后**才纳入覆盖（合成用的必须是它自己的基础策略）
+                TempState t6 = mgr.Start("考试模式", "{\"StartDelaySeconds\":6666}", false, null, "自检", DateTime.UtcNow);
+                DeviceGroup tGy = tGroups.Add("后来建的组");
+                var tPolicyY = Json.ParseObject(catalog.DefaultPolicyJson);
+                PathAccess.Set(tPolicyY, "StartDelaySeconds", 222);
+                GroupPublisher.Publish(keys, tGy, tPolicyY, false, () => tStore.RefreshWatermark(), s => tStore.MarkPublished(s));
+                tGroups.Assign(tGy.Id, "LG-late", null);
+                tGroups.Save();
+                Check(ApiServer.GetPolicy(tStore, tGroups, mgr, "LG-late", null).Body == tGroups.Get(tGy.Id).Envelope,
+                    "12.15 临时状态期间新建的组：在刷新前拿自己的组策略（绝不继承别人组的合成结果）");
+                mgr.RefreshIfActive("自检：新建组后刷新");
+                var tGyEnv = PolicyEnvelope.Parse(mgr.Current.GroupEnvelopes[tGy.Id], keys.Rsa);
+                var tGyJson = Json.ParseObject(tGyEnv.PolicyJson);
+                Check(tGyEnv.Verified && Convert.ToInt32(PathAccess.Get(tGyJson, "StartDelaySeconds")) == 6666 &&
+                      ApiServer.GetPolicy(tStore, tGroups, mgr, "LG-late", null).Body == mgr.Current.GroupEnvelopes[tGy.Id],
+                    "12.15 刷新后它也被临时覆盖纳入（= 它自己的基础策略 ⊕ 同一份临时补丁）");
+                mgr.End("自检结束", DateTime.UtcNow);
+
+                // ---- 有人手改 temp-state.json 塞假信封 → 拒绝采用并清理
+                var forged = new TempState
+                {
+                    Id = "t-forged", Name = "手改的", PatchJson = "{}",
+                    DefaultEnvelope = "LGSRV1|99|2026-01-01T00:00:00Z|0|{}|AAAA",   // 签名是假的
+                    StartedAtUtc = DateTime.UtcNow,
+                };
+                forged.Save(tdir);
+                var mgr3 = new TempStateManager(tdir, keys, tStore, tGroups);
+                mgr3.Load(DateTime.UtcNow);
+                Check(!mgr3.Active && !File.Exists(TempState.PathOf(tdir)),
+                    "12.16 临时状态里的信封验签不过 → 拒绝采用并删掉文件（绝不把不可信内容发出去）");
+                }
             }
         }
 

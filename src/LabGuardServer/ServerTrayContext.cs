@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Windows.Forms;
 using LabGuardServer.Core.Api;
@@ -6,6 +7,7 @@ using LabGuardServer.Core.Catalog;
 using LabGuardServer.Core.Envelope;
 using LabGuardServer.Core.Logging;
 using LabGuardServer.Core.Policy;
+using LabGuardServer.Core.Util;
 
 namespace LabGuardServer
 {
@@ -18,9 +20,16 @@ namespace LabGuardServer
         private CatalogDoc _catalog;
         private NotifyIcon _tray;
         private GroupStore _groups;
+        private TempStateManager _temp;
+        private System.Windows.Forms.Timer _tempWatch;
+        private ToolStripMenuItem _tempMenu;
+        private List<TempPreset> _presets = new List<TempPreset>();
 
         /// <summary>设备分组仓库（v0.11）。</summary>
         public GroupStore Groups { get { return _groups; } }
+
+        /// <summary>临时课堂状态层（v0.12）。</summary>
+        public TempStateManager Temp { get { return _temp; } }
 
         public ServerTrayContext()
         {
@@ -68,6 +77,17 @@ namespace LabGuardServer
 
             _api = new ApiServer(_store, new OnlineList());
             _api.Groups = _groups;      // v0.11：/api/version 与 /api/policy 按设备身份解析分组
+
+            // v0.12 临时课堂状态层：启动即装载（已过期的会被丢弃并把基础策略重发一次）
+            _temp = new TempStateManager(Program.DataDir, _keys, _store, _groups);
+            _temp.Load(DateTime.UtcNow);
+            _temp.StartWatching();
+            _api.Temp = _temp;
+            _presets = TempPresets.Load(Program.DataDir);
+            _tempWatch = new System.Windows.Forms.Timer { Interval = 5000 };
+            _tempWatch.Tick += (s, e) => CheckTempExpiry();
+            _tempWatch.Start();
+
             if (!_api.Start(ApiServer.DefaultPort))
             {
                 MessageBox.Show("HTTP 监听启动失败（端口 " + ApiServer.DefaultPort + " 被占用或无权限）。\n" +
@@ -80,6 +100,81 @@ namespace LabGuardServer
             }
 
             BuildTray();
+        }
+
+        /// <summary>到期检查（每 5 秒）：到点就把基础策略重发一遍（新 seq），学生机自然回到基础策略。</summary>
+        private void CheckTempExpiry()
+        {
+            try
+            {
+                // 外部（CLI/脚本）刚开了或结束了临时状态 → 界面跟着变，不要让老师看着过期信息做决定
+                if (_temp.TryReloadFromDisk())
+                {
+                    RebuildTempMenu();
+                    Balloon("临时课堂状态", _temp.StatusText(DateTime.UtcNow));
+                }
+                string endedName = _temp.Current?.Name;
+                if (_temp.ExpireIfDue(DateTime.UtcNow))
+                {
+                    RebuildTempMenu();
+                    Balloon("临时课堂状态已结束", "【" + endedName + "】已到时间，已自动恢复基础策略（新 seq 已下发）。");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error("临时状态到期检查失败", ex);
+            }
+        }
+
+        private void Balloon(string title, string text)
+        {
+            try
+            {
+                if (_tray == null) return;
+                _tray.BalloonTipTitle = title;
+                _tray.BalloonTipText = text;
+                _tray.ShowBalloonTip(5000);
+            }
+            catch { }
+        }
+
+        /// <summary>开一次临时课堂状态（托盘菜单与策略面板共用）。</summary>
+        internal bool StartTempState(string name, string patchJson, bool paused, int minutes, out string message)
+        {
+            try
+            {
+                DateTime? expires = minutes > 0 ? (DateTime?)DateTime.UtcNow.AddMinutes(minutes) : null;
+                TempState t = _temp.Start(name, patchJson, paused, expires, "面板", DateTime.UtcNow);
+                message = "已开始临时状态【" + t.Name + "】：" + t.RemainingText(DateTime.UtcNow) +
+                          "，覆盖 " + (1 + t.GroupEnvelopes.Count) + " 个目标（学生机 5 秒内生效）";
+                Log.Info(message);
+                RebuildTempMenu();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                message = "开不了临时状态：" + ex.Message;
+                Log.Error("开始临时状态失败", ex);
+                return false;
+            }
+        }
+
+        internal bool EndTempState(out string message)
+        {
+            try
+            {
+                if (!_temp.End("人工结束", DateTime.UtcNow)) { message = "当前没有进行中的临时状态。"; return false; }
+                message = "已结束临时状态【" + _temp.LastEndedName + "】，目标已改回基础策略（新 seq 已下发）。";
+                Log.Info(message);
+                RebuildTempMenu();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                message = "结束临时状态失败：" + ex.Message;
+                Log.Error("结束临时状态失败", ex);
+                return false;
+            }
         }
 
         public PolicyStore Store => _store;
@@ -101,8 +196,10 @@ namespace LabGuardServer
         internal ulong PublishToGroup(DeviceGroup group, System.Collections.Generic.Dictionary<string, object> policy, bool paused)
         {
             ulong seq = GroupPublisher.Publish(_keys, group, policy, paused,
-                () => _store.Watermark, s => _store.MarkPublished(s));
+                () => _store.RefreshWatermark(), s => _store.MarkPublished(s));
             _groups.Save();
+            // 分组策略变了 → 若正在临时状态中，按新基础重算临时信封（否则临时层停在旧基础上）
+            _temp?.RefreshIfActive("分组策略更新：" + group.Name);
             return seq;
         }
         private void BuildTray()
@@ -111,6 +208,8 @@ namespace LabGuardServer
             menu.Items.Add("策略面板（需密码）", null, (s, e) => OpenPolicyForm());
             menu.Items.Add("在线学生机", null, (s, e) => OpenOnlineForm());
             menu.Items.Add("设备分组…", null, (s, e) => OpenGroupsForm());
+            _tempMenu = new ToolStripMenuItem("临时课堂状态");
+            menu.Items.Add(_tempMenu);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("导出配对文件…", null, (s, e) => ExportPairing());
             menu.Items.Add(new ToolStripSeparator());
@@ -129,6 +228,60 @@ namespace LabGuardServer
                 Visible = true,
             };
             _tray.DoubleClick += (s, e) => OpenPolicyForm();
+            RebuildTempMenu();
+        }
+
+        /// <summary>
+        /// 重建「临时课堂状态」子菜单：
+        ///   第一行 = 当前状态（有没有临时覆盖、还剩多久）；
+        ///   中间 = 预设一键应用（改 temp-presets.json 就能改这一列，老师按自己机房定义）；
+        ///   最后 = 结束（只有存在临时覆盖时才可点）。
+        /// 老师切一次常用场景 = 3 次点击以内（托盘 → 本项 → 预设）。
+        /// </summary>
+        internal void RebuildTempMenu()
+        {
+            if (_tempMenu == null) return;
+            _tempMenu.DropDownItems.Clear();
+
+            var status = new ToolStripMenuItem(_temp.StatusText(DateTime.UtcNow)) { Enabled = false };
+            _tempMenu.DropDownItems.Add(status);
+            _tempMenu.DropDownItems.Add(new ToolStripSeparator());
+
+            if (_presets.Count == 0)
+                _tempMenu.DropDownItems.Add(new ToolStripMenuItem("（没有预设：看 temp-presets.json）") { Enabled = false });
+            foreach (TempPreset p in _presets)
+            {
+                string label = p.Name + (p.DurationMinutes > 0 ? "（" + p.DurationMinutes + " 分钟）" : "（不自动到期）");
+                var item = new ToolStripMenuItem(label) { ToolTipText = p.Description ?? "" };
+                TempPreset captured = p;
+                item.Click += (s, e) =>
+                {
+                    string msg;
+                    if (StartTempState(captured.Name, Json.Stringify(captured.Patch), captured.Paused,
+                                       captured.DurationMinutes, out msg))
+                        Balloon("已开始临时课堂状态", msg);
+                    else MessageBox.Show(msg, "LabGuard Server", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                };
+                _tempMenu.DropDownItems.Add(item);
+            }
+
+            _tempMenu.DropDownItems.Add(new ToolStripSeparator());
+            var reload = new ToolStripMenuItem("重新读取预设（temp-presets.json）");
+            reload.Click += (s, e) => { _presets = TempPresets.Load(Program.DataDir); RebuildTempMenu(); };
+            _tempMenu.DropDownItems.Add(reload);
+
+            var end = new ToolStripMenuItem("结束临时状态（回到基础策略）") { Enabled = _temp.Active };
+            end.Click += (s, e) =>
+            {
+                string msg;
+                EndTempState(out msg);
+                Balloon("临时课堂状态", msg);
+            };
+            _tempMenu.DropDownItems.Add(end);
+
+            if (_tray != null)
+                _tray.Text = "LabGuard Server（教师机服务端）" +
+                             (_temp.Active ? "\n临时：" + _temp.Current.Name + "（" + _temp.Current.RemainingText(DateTime.UtcNow) + "）" : "");
         }
 
         private PolicyForm _policyForm;
@@ -139,7 +292,8 @@ namespace LabGuardServer
             // 残留风险（学生碰到教师机就能改策略）与替代做法见 docs/deployment-guide.md「安全边界」。
             if (_policyForm == null || _policyForm.IsDisposed)
             {
-                _policyForm = new PolicyForm(_store, _catalog, _api, _groups, PublishToGroup, OpenGroupsForm);
+                _policyForm = new PolicyForm(_store, _catalog, _api, _groups, PublishToGroup, OpenGroupsForm,
+                                             _temp, StartTempState);
                 _policyForm.Show();
             }
             else

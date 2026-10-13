@@ -14,6 +14,9 @@ using LabGuardServer.Core.Util;
 
 namespace LabGuardServer
 {
+    /// <summary>「临时生效」的执行入口（托盘宿主实现；返回 false 时 message 是失败原因）。</summary>
+    internal delegate bool TempStartDelegate(string name, string patchJson, bool paused, int minutes, out string message);
+
     /// <summary>
     /// 策略面板（v0.10.3 按"职责归属"重写）：
     ///
@@ -43,6 +46,8 @@ namespace LabGuardServer
         private readonly GroupStore _groups;                       // v0.11 分组（可为空 → 只编辑默认策略）
         private readonly Func<DeviceGroup, Dictionary<string, object>, bool, ulong> _publishGroup;
         private readonly Action _openGroupsUi;
+        private readonly TempStateManager _temp;                   // v0.12 临时课堂状态（可为空 → 不显示临时入口）
+        private readonly TempStartDelegate _startTemp;             // (名字,补丁,暂停,分钟) → 给人看的消息
 
         private readonly TextBox _search = new TextBox { BorderStyle = BorderStyle.FixedSingle };
         private readonly CheckBox _onlyChanged = new CheckBox { Text = "只看已改动", AutoSize = true };
@@ -67,7 +72,9 @@ namespace LabGuardServer
         public PolicyForm(PolicyStore store, CatalogDoc catalog, ApiServer api = null,
             GroupStore groups = null,
             Func<DeviceGroup, Dictionary<string, object>, bool, ulong> publishGroup = null,
-            Action openGroupsUi = null)
+            Action openGroupsUi = null,
+            TempStateManager temp = null,
+            TempStartDelegate startTemp = null)
         {
             _store = store;
             _catalog = catalog;
@@ -75,6 +82,8 @@ namespace LabGuardServer
             _groups = groups;
             _publishGroup = publishGroup;
             _openGroupsUi = openGroupsUi;
+            _temp = temp;
+            _startTemp = startTemp;
 
             Icon = AppIcon.Get();
             Text = "LabGuard 教师端 · 策略面板（只负责下发策略；改完点「保存并下发」）";
@@ -118,13 +127,19 @@ namespace LabGuardServer
             Button resume = MakeButton("全员恢复", 92, Color.White, Color.FromArgb(60, 60, 60));
             resume.SetBounds(506, 9, 92, 30); resume.Top = 40;
             resume.Click += (s, e) => PauseAll(false);
+            // v0.12：把面板里当前这批改动**临时**生效（可选时长），到点自动回到基础策略。
+            // 与「保存并下发」的区别只有"会不会到期"——不想让考试模式留到明天早上就用这个。
+            Button tempBtn = MakeButton("临时生效…", 96, Color.FromArgb(0, 95, 90), Color.White);
+            tempBtn.SetBounds(606, 40, 96, 30);
+            tempBtn.Enabled = _temp != null;
+            tempBtn.Click += (s, e) => StartTempFromPanel();
             var who = new Label
             {
                 Text = "教师端只下发策略；管控动作全部由学生机执行",
                 AutoSize = true, Left = 862, Top = 18, ForeColor = Color.FromArgb(120, 124, 130),
             };
             _changedLabel.SetBounds(900, 18, 120, 18);
-            top.Controls.AddRange(new Control[] { save, diff, pause, resume, who, _changedLabel });
+            top.Controls.AddRange(new Control[] { save, diff, pause, resume, tempBtn, who, _changedLabel });
 
             // ---------------- 左栏：三层归属树
             var left = new Panel { Dock = DockStyle.Fill, BackColor = Color.White };
@@ -485,6 +500,106 @@ namespace LabGuardServer
             _status.Text = "  " + state + targetTxt + "    |    在线学生机 " + online + "    |    监听 " + (_api?.BoundPrefix ?? "—") +
                            "    |    开关目录：客户端 v" + _catalog.ClientVersion + "（" + _catalog.Fields.Count + " 项，面板显示 " +
                            VisibleFields().Count() + " 项）";
+            // v0.12：**UI 始终显示当前是否存在临时覆盖**（执行计划 §F3 明文要求）——放在最前面，不被别的信息淹没
+            if (_temp != null && _temp.Active)
+                _status.Text = "  ⚑ 临时课堂状态【" + _temp.Current.Name + "】" + _temp.Current.RemainingText(DateTime.UtcNow) + "    |    " +
+                               _status.Text.TrimStart();
+        }
+
+        /// <summary>
+        /// 「临时生效…」：把面板里当前这批改动**临时**下发（可选到期时间），到点自动回到基础策略。
+        /// 这里的补丁 = 面板当前策略全文（深合并的语义下"全文当补丁"就等于"这批值生效"），
+        /// 结束/到期时服务端会把基础策略原样重发一次，所以不需要老师把每一项改回去。
+        /// </summary>
+        private void StartTempFromPanel()
+        {
+            if (_temp == null) return;
+            FlushBindings();
+            DeviceGroup target = TargetGroup();
+            if (target != null)
+            {
+                MessageBox.Show(this, "临时课堂状态是**整机房**的（覆盖默认组 + 各组），不支持只对某个组临时生效。\n" +
+                                      "请把「下发目标」切回「全部设备（默认策略）」再操作。", Text,
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            int minutes;
+            if (!AskTempMinutes(out minutes)) return;
+            if (!ShowDiff(false)) return;
+            string name = "面板临时覆盖";
+            // 优先走托盘宿主注入的实现（它会顺带刷新托盘菜单与气泡提示），单测场景直接走管理器
+            string msg;
+            bool ok = _startTemp != null
+                ? _startTemp(name, Json.Stringify(_policy), false, minutes, out msg)
+                : FallbackStartTemp(name, minutes, out msg);
+            if (!ok) { MessageBox.Show(this, msg, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+            _published = Json.ParseObject(Json.Stringify(_policy));
+            RebuildTree(); RebuildBody(); RefreshStatus();
+            MessageBox.Show(this, msg + Environment.NewLine + Environment.NewLine +
+                                  (minutes > 0 ? ("到点会自动回到基础策略（" + minutes + " 分钟后）。")
+                                              : "本次临时状态**不会自动到期**，请在托盘菜单里「结束临时状态」。"),
+                Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        /// <summary>没有托盘宿主时（单测/命令行场景）直接走管理器。</summary>
+        private bool FallbackStartTemp(string name, int minutes, out string message)
+        {
+            try
+            {
+                DateTime? expires = minutes > 0 ? (DateTime?)DateTime.UtcNow.AddMinutes(minutes) : null;
+                TempState t = _temp.Start(name, Json.Stringify(_policy), false, expires, "面板", DateTime.UtcNow);
+                message = "已开始临时状态【" + t.Name + "】：" + t.RemainingText(DateTime.UtcNow) +
+                          "，覆盖 " + (1 + t.GroupEnvelopes.Count) + " 个目标（学生机 5 秒内生效）";
+                return true;
+            }
+            catch (Exception ex) { message = "开不了临时状态：" + ex.Message; return false; }
+        }
+
+        /// <summary>问"临时生效多久"：常用档位一键点，或自己填分钟数，或选"不自动到期"。</summary>
+        private bool AskTempMinutes(out int minutes)
+        {
+            int picked = 0;
+            using (var dlg = new Form
+            {
+                Text = "临时课堂状态：生效多久？",
+                FormBorderStyle = FormBorderStyle.FixedDialog,
+                StartPosition = FormStartPosition.CenterParent,
+                ClientSize = new Size(360, 190),
+                MinimizeBox = false, MaximizeBox = false, Icon = AppIcon.Get(),
+                Font = new Font("微软雅黑", 9F),
+            })
+            {
+                var info = new Label
+                {
+                    Left = 16, Top = 14, Width = 328, Height = 44,
+                    Text = "到点后**自动回到基础策略**（老师不用改回来）。\n常用：30 / 45 / 60 / 90 分钟；也可以填自己的分钟数。",
+                };
+                var combo = new ComboBox { Left = 16, Top = 66, Width = 130, DropDownStyle = ComboBoxStyle.DropDownList };
+                combo.Items.AddRange(new object[] { "30 分钟", "45 分钟", "60 分钟", "90 分钟", "不自动到期" });
+                combo.SelectedIndex = 2;
+                var num = new NumericUpDown { Left = 156, Top = 66, Width = 90, Minimum = 1, Maximum = 24 * 60, Value = 60 };
+                var numLabel = new Label { Left = 250, Top = 70, Width = 90, Text = "分钟（自定义）" };
+                combo.SelectedIndexChanged += (s, e) =>
+                {
+                    bool custom = combo.SelectedIndex == 4;
+                    num.Enabled = custom;
+                };
+                num.Enabled = false;
+                var ok = new Button { Text = "开始临时状态", Left = 16, Top = 112, Width = 140, Height = 30, BackColor = Color.FromArgb(0, 95, 90), ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
+                var cancel = new Button { Text = "取消", Left = 166, Top = 112, Width = 80, Height = 30, DialogResult = DialogResult.Cancel, FlatStyle = FlatStyle.Flat };
+                var hint = new Label { Left = 16, Top = 150, Width = 330, Height = 30, ForeColor = Color.FromArgb(150, 150, 150), Text = "提示：托盘菜单里的预设（考试模式等）也是一键生效，改 temp-presets.json 可自定义。" };
+                dlg.Controls.AddRange(new Control[] { info, combo, num, numLabel, ok, cancel, hint });
+                dlg.AcceptButton = ok;
+                dlg.CancelButton = cancel;
+                ok.Click += (s, e) =>
+                {
+                    picked = combo.SelectedIndex == 4 ? (int)num.Value : new[] { 30, 45, 60, 90 }[combo.SelectedIndex];
+                    dlg.DialogResult = DialogResult.OK;
+                };
+                if (dlg.ShowDialog(this) != DialogResult.OK) { minutes = 0; return false; }
+            }
+            minutes = picked;
+            return true;
         }
 
         private void SavePolicy()
@@ -507,6 +622,8 @@ namespace LabGuardServer
                 }
                 bool paused = _store.Version()?.Paused ?? false;
                 PolicyVersion v = _store.Save(_policy, paused, _catalog.DefaultPolicyJson);
+                // 正在临时状态中又改了基础策略 → 临时层要按新基础重算（否则临时信封停在旧基础上）
+                _temp?.RefreshIfActive("面板保存了默认策略");
                 _published = Json.ParseObject(Json.Stringify(_policy));
                 RebuildTree();
                 RebuildBody();
@@ -538,6 +655,11 @@ namespace LabGuardServer
             if (changes.Count > 12) bodyText += Environment.NewLine + "…还有 " + (changes.Count - 12) + " 项";
             if (changes.Any(c => c.Dangerous))
                 bodyText += Environment.NewLine + Environment.NewLine + "⚠ 其中包含【危险】项，请再确认一次。";
+            // 执行计划 §F4：预览里要能看到"临时覆盖是否存在及预计结束时间"
+            if (_temp != null && _temp.Active)
+                bodyText += Environment.NewLine + Environment.NewLine +
+                            "⚑ 当前**存在临时课堂状态**【" + _temp.Current.Name + "】" +
+                            _temp.Current.RemainingText(DateTime.UtcNow) + "；本次保存会同时按新基础重算临时策略。";
             if (previewOnly)
             {
                 MessageBox.Show(this, head + Environment.NewLine + Environment.NewLine + bodyText, Text,
@@ -569,6 +691,7 @@ namespace LabGuardServer
                     return;
                 }
                 _store.Save(_policy, paused, _catalog.DefaultPolicyJson);
+                _temp?.RefreshIfActive(paused ? "面板全员暂停" : "面板全员恢复");
                 _published = Json.ParseObject(Json.Stringify(_policy));
                 RebuildTree();
                 RefreshStatus();

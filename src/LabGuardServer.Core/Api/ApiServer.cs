@@ -40,6 +40,12 @@ namespace LabGuardServer.Core.Api
         /// <summary>设备分组仓库（v0.11）：为空 = 不启用分组，人人拿默认策略（与 v0.10 行为一致）。</summary>
         public GroupStore Groups { get; set; }
 
+        /// <summary>
+        /// 临时课堂状态（v0.12）：为空 = 没有临时层。
+        /// 解析优先级 **临时状态 &gt; 分组 &gt; 默认**（见 <see cref="GetVersion(PolicyStore, GroupStore, Policy.TempStateManager, string, string)"/>）。
+        /// </summary>
+        public TempStateManager Temp { get; set; }
+
         public ApiServer(PolicyStore store, OnlineList online)
         {
             _store = store;
@@ -116,12 +122,12 @@ namespace LabGuardServer.Core.Api
 
             if (path == "/api/version" && isGet)
             {
-                Respond(ctx, GetVersion(_store, Groups, Query(ctx, "device"), Query(ctx, "machine")));
+                Respond(ctx, GetVersion(_store, Groups, Temp, Query(ctx, "device"), Query(ctx, "machine")));
                 return;
             }
             if (path == "/api/policy" && isGet)
             {
-                Respond(ctx, GetPolicy(_store, Groups, Query(ctx, "device"), Query(ctx, "machine")));
+                Respond(ctx, GetPolicy(_store, Groups, Temp, Query(ctx, "device"), Query(ctx, "machine")));
                 return;
             }
             if (path == "/api/checkin" && method == "POST")
@@ -233,10 +239,23 @@ namespace LabGuardServer.Core.Api
         /// <summary>GET /api/version（带设备身份）：命中分组的设备拿该组策略的版本，否则回落默认策略。</summary>
         public static ApiReply GetVersion(PolicyStore store, GroupStore groups, string device, string machine)
         {
+            return GetVersion(store, groups, null, device, machine);
+        }
+
+        /// <summary>
+        /// GET /api/version（带设备身份 + 临时状态层）：解析优先级 **临时状态 &gt; 分组 &gt; 默认**（执行计划 §F3）。
+        /// 临时状态由服务端在发布时合成（客户端无新字段），所以这里只是多一层"信封从哪儿取"。
+        /// </summary>
+        public static ApiReply GetVersion(PolicyStore store, GroupStore groups, TempStateManager temp,
+            string device, string machine)
+        {
             // 每次解析前先看分组文件有没有变（内部只比时间戳，没变立刻返回；变了才重读）。
             // 不依赖 FileSystemWatcher 的投递：脚本刚写完 groups.json 就要能马上生效，测试才可重复。
             if (groups != null) groups.TryReloadFromDisk();
+            temp?.TryReloadFromDisk();     // 同理：外部（CLI/脚本）开的临时状态要马上生效
             DeviceGroup g = groups?.Resolve(device, machine);
+            string tempEnv = temp?.EnvelopeFor(g);
+            if (!string.IsNullOrEmpty(tempEnv)) return VersionOfEnvelope(tempEnv);
             if (g != null && !string.IsNullOrEmpty(g.Envelope)) return VersionOfEnvelope(g.Envelope);
             return GetVersion(store);
         }
@@ -244,8 +263,19 @@ namespace LabGuardServer.Core.Api
         /// <summary>GET /api/policy（带设备身份）：命中分组的设备拿该组信封，否则回落默认策略。</summary>
         public static ApiReply GetPolicy(PolicyStore store, GroupStore groups, string device, string machine)
         {
+            return GetPolicy(store, groups, null, device, machine);
+        }
+
+        /// <summary>GET /api/policy（带设备身份 + 临时状态层）：优先级 **临时状态 &gt; 分组 &gt; 默认**。</summary>
+        public static ApiReply GetPolicy(PolicyStore store, GroupStore groups, TempStateManager temp,
+            string device, string machine)
+        {
             if (groups != null) groups.TryReloadFromDisk();
+            temp?.TryReloadFromDisk();
             DeviceGroup g = groups?.Resolve(device, machine);
+            string tempEnv = temp?.EnvelopeFor(g);
+            if (!string.IsNullOrEmpty(tempEnv))
+                return new ApiReply { Status = 200, ContentType = "text/plain; charset=utf-8", Body = tempEnv };
             if (g != null && !string.IsNullOrEmpty(g.Envelope))
                 return new ApiReply { Status = 200, ContentType = "text/plain; charset=utf-8", Body = g.Envelope };
             return GetPolicy(store);

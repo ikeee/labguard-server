@@ -43,7 +43,9 @@ namespace LabGuardServer
             return Has(args, "--headless") || Has(args, "--export-pairing") || Has(args, "--set-policy")
                 || Has(args, "--policy-default") || Has(args, "--screenshot")
                 || Has(args, "--add-group") || Has(args, "--assign") || Has(args, "--group-policy")
-                || Has(args, "--pause-default") || Has(args, "--resume-default");
+                || Has(args, "--pause-default") || Has(args, "--resume-default")
+                || Has(args, "--temp-preset") || Has(args, "--temp-start")
+                || Has(args, "--temp-end") || Has(args, "--temp-status");
         }
 
         public static int Run(string[] args, string dataDir)
@@ -91,6 +93,11 @@ namespace LabGuardServer
             }
             output.WriteLine("当前策略：seq=" + store.CurrentSeq +
                               (store.CurrentEnvelope == null ? "（尚未配置）" : "") + "  水位=" + store.Watermark);
+
+            // 临时课堂状态层（v0.12）：启动即装载；**已过期的直接丢弃并重发基础策略**（不允许"睡一觉还在考试模式"）
+            var temp = new TempStateManager(dataDir, keys, store, groups);
+            temp.Load(DateTime.UtcNow);
+            temp.StartWatching();      // 别的进程（GUI/另一个脚本）开的临时状态也要拾取
 
             // 界面截图（文档 / 人工核对）：把策略面板的每个分组 + 搜索示例渲染成 PNG，不改变任何策略
             string shotDir = Value(args, "--screenshot");
@@ -176,6 +183,68 @@ namespace LabGuardServer
                     output.WriteLine("  【" + g.Name + "】" + g.Id + "  成员 " + (g.DeviceIds.Count + g.Machines.Count) +
                                      "  seq " + g.Seq + (string.IsNullOrEmpty(g.Envelope) ? "（尚未下发策略）" : ""));
             }
+
+            // ---- 临时课堂状态命令（v0.12，与托盘菜单同一实现；测试台与无人值守都走这里）
+            bool tempTouched = false;
+            string presetName = Value(args, "--temp-preset");
+            string patchFile = Value(args, "--temp-start");
+            if (!string.IsNullOrEmpty(presetName) || !string.IsNullOrEmpty(patchFile))
+            {
+                string patchJson;
+                string name = Value(args, "--temp-name");
+                bool paused = Has(args, "--temp-paused");
+                int minutes = ParseInt(Value(args, "--temp-minutes"), -1);
+                int durSeconds = ParseInt(Value(args, "--temp-seconds"), -1);
+                if (!string.IsNullOrEmpty(presetName))
+                {
+                    TempPreset p = TempPresets.Find(TempPresets.Load(dataDir), presetName);
+                    if (p == null) { output.WriteLine("失败：预设不存在：" + presetName); return 6; }
+                    patchJson = Json.Stringify(p.Patch);
+                    paused = paused || p.Paused;
+                    if (string.IsNullOrEmpty(name)) name = p.Name;
+                    if (minutes < 0 && durSeconds < 0) minutes = p.DurationMinutes;   // 0 = 不自动到期
+                }
+                else
+                {
+                    if (!File.Exists(patchFile)) { output.WriteLine("失败：临时覆盖文件不存在：" + patchFile); return 6; }
+                    patchJson = File.ReadAllText(patchFile, Encoding.UTF8);
+                    if (string.IsNullOrEmpty(name)) name = Path.GetFileNameWithoutExtension(patchFile);
+                }
+                int totalSeconds = durSeconds >= 0 ? durSeconds : (minutes > 0 ? minutes * 60 : -1);
+                DateTime? expires = totalSeconds > 0 ? (DateTime?)DateTime.UtcNow.AddSeconds(totalSeconds) : null;
+                try
+                {
+                    TempState t = temp.Start(name, patchJson, paused, expires, "CLI", DateTime.UtcNow);
+                    output.WriteLine("已开始临时状态【" + t.Name + "】：" + t.RemainingText(DateTime.UtcNow) +
+                                     "，覆盖 " + (1 + t.GroupEnvelopes.Count) + " 个目标，seq 至 " + t.MaxSeq);
+                }
+                catch (Exception ex)
+                {
+                    output.WriteLine("失败：开不了临时状态（" + ex.Message + "）");
+                    return 6;
+                }
+                tempTouched = true;
+            }
+            if (Has(args, "--temp-end"))
+            {
+                if (temp.End("CLI 结束", DateTime.UtcNow))
+                    output.WriteLine("已结束临时状态【" + temp.LastEndedName + "】→ 目标已改回基础策略（新 seq 已下发）");
+                else output.WriteLine("当前没有进行中的临时状态");
+                tempTouched = true;
+            }
+            if (Has(args, "--temp-status"))
+            {
+                output.WriteLine("临时状态：" + temp.StatusText(DateTime.UtcNow));
+                if (temp.Current != null)
+                    output.WriteLine("  覆盖：默认组 + " + temp.Current.GroupEnvelopes.Count +
+                                     " 个分组；补丁 " + temp.Current.PatchJson);
+                tempTouched = true;
+            }
+            // 本进程刚发布过基础/分组策略 → 临时状态必须按新基础重算（否则临时信封停在旧基础上）
+            if (!tempTouched && temp.Active && (Has(args, "--set-policy") || Has(args, "--policy-default") ||
+                                                Values(args, "--group-policy").Count > 0))
+                temp.RefreshIfActive("CLI 发布了新的基础/分组策略");
+
             // 配对文件导出（不需要起 HTTP）
             string pairingOut = Value(args, "--export-pairing");
             int port = ParsePort(args, ApiServer.DefaultPort);
@@ -203,6 +272,7 @@ namespace LabGuardServer
             var api = new ApiServer(store, online);
             api.Groups = groups;      // **必须接上**：不然 /api/version、/api/policy 永远回落默认策略，
                                       // 表现就是"分组命令执行成功、学生机却一直拿默认策略"（2026-10-13 测试台实测）
+            api.Temp = temp;          // v0.12 临时课堂状态层（优先级：临时 > 分组 > 默认）
             if (!api.Start(port, Has(args, "--bind-all") ? null : "127.0.0.1"))
             {
                 output.WriteLine("失败：HTTP 监听启动失败（端口 " + port + " 被占用或无权限）。");
@@ -210,6 +280,17 @@ namespace LabGuardServer
                 return 5;
             }
             output.WriteLine("HTTP 已监听：" + api.BoundPrefix + "（未配置策略时 /api/version 返回 503）");
+
+            // 临时状态到期检查：无界面模式也要"到点自动恢复基础策略"（每 5 秒看一次）
+            var tempTimer = new System.Threading.Timer(_ =>
+            {
+                try
+                {
+                    if (temp.ExpireIfDue(DateTime.UtcNow))
+                        output.WriteLine("[临时状态] 已到期 → 已自动恢复基础策略（新 seq）");
+                }
+                catch (Exception ex) { Log.Warn("临时状态到期检查异常：" + ex.Message); }
+            }, null, 5000, 5000);
 
             int seconds = 0;
             int.TryParse(Value(args, "--seconds"), out seconds);
@@ -227,20 +308,28 @@ namespace LabGuardServer
             }
 
             output.WriteLine("设备清单（最近 " + (int)online.OfflineAfter.TotalSeconds + " 秒内有心跳）：");
+            if (temp.Active) output.WriteLine("  ⚠ " + temp.StatusText(DateTime.UtcNow));
             CheckinRecord[] snapshot = online.Snapshot();
             if (snapshot.Length == 0) output.WriteLine("  （无）");
             string serverVer = typeof(ServerCli).Assembly.GetName().Version.ToString(3);
             foreach (CheckinRecord r in snapshot)
             {
-                DeviceStatus st = DeviceModel.Compute(r, store.CurrentSeq, serverVer, DateTime.UtcNow, online.OfflineAfter);
                 DeviceGroup owner = groups.Resolve(r.DeviceId, r.Machine);
+                // "服务端 seq" 要按该设备**实际生效的那一层**算：临时 > 分组 > 默认。
+                // 用默认层的 seq 会把分组设备一律标成"待应用"（分组信封 seq 本来就更小），是错的。
+                ulong effSeq = temp.EffectiveSeqFor(owner);
+                if (effSeq == 0) effSeq = owner != null && !string.IsNullOrEmpty(owner.Envelope)
+                    ? PolicyEnvelope.ParseHeader(owner.Envelope).Seq : store.CurrentSeq;
+                DeviceStatus st = DeviceModel.Compute(r, effSeq, serverVer, DateTime.UtcNow, online.OfflineAfter);
                 output.WriteLine("  " + r.Machine + "  dev=" + (string.IsNullOrEmpty(r.DeviceId) ? "-" : r.DeviceId) +
                                  "  " + r.Ip + "  v" + r.Version + "  seq=" + r.Seq + "  applied=" + r.AppliedSeq +
                                  "  status=" + (string.IsNullOrEmpty(r.Status) ? "-" : r.Status) +
                                  "  state=" + DeviceModel.Describe(st) +
                                  "  group=" + (owner == null ? "默认策略" : owner.Name) +
+                                 "  effSeq=" + effSeq +
                                  (r.Paused ? "  已暂停" : ""));
             }
+            tempTimer.Dispose();
             api.Stop();
             keys.Dispose();
             return 0;
@@ -293,6 +382,12 @@ namespace LabGuardServer
             int port;
             string raw = Value(args, "--port");
             return int.TryParse(raw, out port) && port > 0 && port <= 65535 ? port : fallback;
+        }
+
+        /// <summary>整数参数（解析不了就用 fallback；负数/0 由调用方按语义解释）。</summary>
+        private static int ParseInt(string raw, int fallback)
+        {
+            return int.TryParse(raw, out int v) ? v : fallback;
         }
     }
 }
