@@ -50,9 +50,13 @@ powershell -File scripts\verify-sandbox.ps1 -KeepRoot    # 保留临时目录供
 |---|---|
 | LabGuard 注册表 | `HKLM\SOFTWARE\LabGuard`、`HKCU\SOFTWARE\LabGuard`、卸载项（含全部子键/值） |
 | 浏览器策略 | `HKLM\SOFTWARE\Policies\{Google, Microsoft\Edge, Mozilla}`、`RemovableStorageDevices` |
+| **会话策略（v0.13）** | `…\CurrentVersion\Policies\System`（禁快速切换用户）、`Policies\Microsoft\Windows NT\Terminal Services` 与 `SYSTEM\…\Control\Terminal Server`（禁远程桌面） |
 | 服务 | `usbstor Start`、`LabGuardSvc Start` |
 | 启动 | `bcdedit {bootmgr}` 的 `displaybootmenu` |
 | 文件 | `%ProgramData%\LabGuard`（除 `logs`）的文件清单+大小、`hosts` 哈希 |
+
+> 加开关就得同步加"被比对的真机面"：v0.13 新增的两个开关写的是**新的注册表位置**，
+> 如果安全闸不跟着扩，一旦隔离破了它照样报"完全没变"——这正是 2026-10-13 事故的教训。
 
 > **纪律：任何改动客户端之后先跑它。** 2026-10-13 的事故就是跳过这一步直接跑场景导致的。
 

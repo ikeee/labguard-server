@@ -390,6 +390,9 @@ namespace LabGuardServer.SelfTest
                     "7.14 电子教室保护 → 学生端自保（学生机执行，不是教师端的活）");
                 Check(PolicyOwnership.Of(sections.First(s => s.StartsWith("14、", StringComparison.Ordinal))) == PolicyTier.SelfProtect,
                     "7.15 进程防拆加固 → 学生端自保");
+                Check(PolicyOwnership.Of(sections.First(s => s.StartsWith("16、", StringComparison.Ordinal))) == PolicyTier.Classroom &&
+                      PolicyOwnership.VisibleInPanel(sections.First(s => s.StartsWith("16、", StringComparison.Ordinal))),
+                    "7.15b 防会话逃逸（换用户/新会话）→ 课堂管控，老师能调（v0.13 新增组）");
                 Check(PolicyOwnership.Of(sections.First(s => s.StartsWith("15、", StringComparison.Ordinal))) == PolicyTier.ServerLocal &&
                       !PolicyOwnership.VisibleInPanel(sections.First(s => s.StartsWith("15、", StringComparison.Ordinal))),
                     "7.16 服务器统一管控 → 教师端自身，面板不显示（学生机不收这组值）");

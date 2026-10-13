@@ -91,6 +91,9 @@ function Get-MachineState {
         'HKLM:\SOFTWARE\Policies\Microsoft\Edge',
         'HKLM:\SOFTWARE\Policies\Mozilla',
         'HKLM:\SOFTWARE\Policies\Microsoft\Windows\RemovableStorageDevices',
+        'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System',
+        'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server',
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\LabGuard'
     )) {
         foreach ($l in (Get-RegDump $p)) { [void]$lines.Add('REG ' + $p + ' ' + $l) }

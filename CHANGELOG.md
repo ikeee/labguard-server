@@ -1,5 +1,46 @@
 # 更新记录
 
+## v0.13.0（2026-10-13 · 防会话逃逸：堵住"换用户 / 新会话"这条最硬的逃逸路）
+
+**动机**：v0.12 的课堂演练把"多开桌面脱离管制"拆开看，最硬的一条不是虚拟桌面（`Shell.BlockWindowsKey`
+已经屏蔽 Win+Tab），而是 **Ctrl+Alt+Del → 切换用户**：换个账号登录，当前会话里的一切（HKCU 任务栏策略、
+锁屏/键鼠锁）就都不作数了。
+
+**客户端新增「16、防会话逃逸（换用户/新会话）」组**（3 个开关，机器级策略，由服务侧 SystemCore 执行）：
+
+- `Session.BlockFastUserSwitch`（默认开）→ `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\HideFastUserSwitching=1`：
+  登录界面 / 开始菜单 / 任务管理器里的「切换用户」入口全部消失。**机器级 = 换谁登录都生效**。
+- `Session.DenyRemoteDesktop`（默认关）→ `…Control\Terminal Server` 与 `Policies\Microsoft\Windows NT\Terminal Services`
+  的 `fDenyTSConnections=1`：本机不再接受 RDP，防止用远程桌面开第二个会话。默认关是因为
+  "老师自己远程连这台机排障"是常见用法。
+- `Session.Enabled` 总开关；`SessionGuard` 走 `GuardBase` 的既有形态（30 秒轮询 + 被改回就自动还原 + 报告违规）。
+
+**落盘前先备份原值、退出/卸载逐项还原**（`session-policy-backup.json`）：程序动过的系统开关必须能还回去
+（教训来自 SAFEMODE 那次）。两个细节专门写进了自检：
+① **没有备份文件时停止"绝不动系统"**——那说明这两项不是本程序写的，顺手删掉会把管理员/组策略设的值一起抹掉；
+② **干跑（自检/沙箱）不写备份、不落痕迹**（自检纪律：不碰真实 `%ProgramData%`）。
+另外这两条都是 HKLM，**只由服务侧写**，用户会话侧不重复挂（否则两个进程互抢同一批值与备份）。
+
+**顺带补的安全闸**：`verify-sandbox.ps1` 的真机快照新增三个位置
+（`…\CurrentVersion\Policies\System`、`Policies\Microsoft\Windows NT\Terminal Services`、
+`SYSTEM\…\Control\Terminal Server`）——**加了开关就得同步加"被比对的真机面"**，
+否则隔离破了它照样报"完全没变"（2026-10-13 事故的教训）。
+
+**课堂演练**加第 6 个动作（学生 Ctrl+Alt+Del 想换用户 → 老师仍只点 1 下）：断言信封里带上
+`BlockFastUserSwitch`，并断言**学生机日志里真的出现 `[dry] SET-REG … HideFastUserSwitching = 1`**
+（证明开关走到了执行层，而不只是"策略发过去了"）。
+
+**开关目录**：122 项 / 17 组（客户端 `--export-catalog` 重出并同步进 `assets/catalog.json`，
+两仓不再漂移）；`PolicyOwnership` 把新组归入**课堂管控**层（老师可调）。
+
+自检：服务端 **158 → 159 条**、客户端 **245 → 253 条**（+8：默认值/存读/目录/两个角色挂载口径/
+干跑写到正确位置/默认不碰 RDP/无备份不动系统）全绿；场景套件 28 → **30/30**。
+版本 0.12.0 → **0.13.0**（客户端同步 lockstep，本次客户端**有**功能变化）。
+
+**诚实边界**（写进 `docs/classroom-playbook.md`）：学生**仍可注销**（注销不能逃逸——本程序是机器级服务，
+注销后那个会话没人）；知道别的账号密码仍可注销后登录（账号与制度问题，且登进去后机器级策略照旧生效、
+会话级策略会被重新应用）；本地管理员 / PE 启动不受任何用户态程序限制。
+
 ## v0.12.0（2026-10-13 · 临时课堂状态层：上课/严管/考试一键切，到点自动回基础策略）
 
 **动机**（用户原话）："模拟一节课堂：学生一直在捣蛋破坏电脑、到外网玩在线游戏、多开桌面脱离管制，

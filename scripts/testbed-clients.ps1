@@ -286,6 +286,7 @@ $presets = @'
  {"name":"课堂严管+桌面防逃","description":"有人多开桌面逃管制：再屏蔽 Win 键/任务视图/任务管理器","durationMinutes":45,
   "patch":{"StartDelaySeconds":4303,"ProcessBlock":{"Enabled":true,"BlockGames":true,"BlockVirtualDesktop":true,"BlockTaskManager":true,"BlockCommandPrompt":true},
            "Shell":{"Enabled":true,"HideTaskView":true,"BlockWindowsKey":true,"DisableTaskManager":true,"DisableCmd":true},
+           "Session":{"Enabled":true,"BlockFastUserSwitch":true},
            "Browser":{"Enabled":true,"BlockDownloads":true,"BlockChromeDino":true,"BlockEdgeSurf":true},
            "Network":{"EnforceDns":true,"BlockDoh":true},"Usb":{"Enabled":true,"AllowStorage":false}}},
  {"name":"全班暂停（讲评）","description":"老师要讲评，全班先停下来","durationMinutes":10,"paused":true,"patch":{}}
@@ -317,17 +318,27 @@ Ledger '00:08' '打外网游戏 + 插 U 盘' '点 1 下：课堂严管' $Clients
 
 # ---- ③ 有人多开桌面想逃管制
 Say '  [00:15] 学生C：按 Win+Tab 开虚拟桌面，把游戏窗口藏到第二个桌面'
-Say '           老师：还是 1 下 —— 换「课堂严管+桌面防逃」（屏蔽 Win 键/任务视图 + 拦虚拟桌面软件）'
+Say '           学生D：Ctrl+Alt+Del 想「切换用户」，换个账号继续玩'
+Say '           老师：还是 1 下 —— 换「课堂严管+桌面防逃」（屏蔽 Win 键/任务视图 + 拦虚拟桌面软件 + 禁换用户）'
 Start-ClassPreset '课堂严管+桌面防逃'
 $took = Wait-AllCached '"StartDelaySeconds":4303'
 $okEscape = $true
 foreach ($d in $clientDirs) {
     $c = Cached-Policy $d
     if (-not $c.Contains('"BlockWindowsKey":true') -or -not $c.Contains('"HideTaskView":true') -or
-        -not $c.Contains('"BlockVirtualDesktop":true')) { $okEscape = $false }
+        -not $c.Contains('"BlockVirtualDesktop":true') -or -not $c.Contains('"BlockFastUserSwitch":true')) { $okEscape = $false }
 }
-Check ('课堂③ 桌面防逃开关全班到位（' + [math]::Round($took, 1) + 's）：BlockWindowsKey + HideTaskView + BlockVirtualDesktop') `
+Check ('课堂③ 桌面/会话防逃开关全班到位（' + [math]::Round($took, 1) + 's）：BlockWindowsKey + HideTaskView + BlockVirtualDesktop + BlockFastUserSwitch') `
     (($took -ge 0) -and $okEscape)
+# 学生机上真的走到执行层了吗？（沙箱是干跑：日志里应是 [dry] SET-REG；"禁快速切换用户"写的是 HKLM 机器级位置）
+$escapeDry = $false
+foreach ($d in $clientDirs) {
+    $lg = Join-Path $d 'client-out.log'
+    if (Test-Path -LiteralPath $lg) {
+        if ((Get-Content -LiteralPath $lg -Raw -Encoding UTF8).Contains('Policies\System\HideFastUserSwitching = 1')) { $escapeDry = $true }
+    }
+}
+Check '课堂③ 学生机日志里出现 [dry] 写「禁快速切换用户」（证明开关真的走到了执行层）' $escapeDry
 Ledger '00:15' '多开桌面逃管制' '点 1 下：课堂严管+桌面防逃' $Clients ([math]::Round($took, 1).ToString() + 's')
 
 # ---- ④ 个别人继续破坏电脑：只处理他，不牵连全班（分组 + 临时层自动重算）
