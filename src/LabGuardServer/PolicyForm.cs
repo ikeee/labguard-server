@@ -7,6 +7,7 @@ using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using LabGuardServer.Core.Api;
 using LabGuardServer.Core.Catalog;
+using LabGuardServer.Core.Envelope;
 using LabGuardServer.Core.Logging;
 using LabGuardServer.Core.Policy;
 using LabGuardServer.Core.Util;
@@ -39,6 +40,9 @@ namespace LabGuardServer
         private readonly PolicyStore _store;
         private readonly CatalogDoc _catalog;
         private readonly ApiServer _api;
+        private readonly GroupStore _groups;                       // v0.11 分组（可为空 → 只编辑默认策略）
+        private readonly Func<DeviceGroup, Dictionary<string, object>, bool, ulong> _publishGroup;
+        private readonly Action _openGroupsUi;
 
         private readonly TextBox _search = new TextBox { BorderStyle = BorderStyle.FixedSingle };
         private readonly CheckBox _onlyChanged = new CheckBox { Text = "只看已改动", AutoSize = true };
@@ -46,6 +50,7 @@ namespace LabGuardServer
         private readonly Panel _body = new Panel { AutoScroll = true, Dock = DockStyle.Fill, BackColor = Color.FromArgb(248, 249, 251) };
         private readonly Label _status = new Label { Dock = DockStyle.Fill, ForeColor = Color.DimGray, TextAlign = ContentAlignment.MiddleLeft };
         private readonly Label _changedLabel = new Label { AutoSize = true };
+        private readonly ComboBox _target = new ComboBox();      // 「全部设备（默认策略）」或某个组
         private readonly Timer _poll = new Timer { Interval = 3000 };
 
         private Dictionary<string, object> _policy;
@@ -59,11 +64,17 @@ namespace LabGuardServer
             public Panel Strip;
         }
 
-        public PolicyForm(PolicyStore store, CatalogDoc catalog, ApiServer api = null)
+        public PolicyForm(PolicyStore store, CatalogDoc catalog, ApiServer api = null,
+            GroupStore groups = null,
+            Func<DeviceGroup, Dictionary<string, object>, bool, ulong> publishGroup = null,
+            Action openGroupsUi = null)
         {
             _store = store;
             _catalog = catalog;
             _api = api;
+            _groups = groups;
+            _publishGroup = publishGroup;
+            _openGroupsUi = openGroupsUi;
 
             Icon = AppIcon.Get();
             Text = "LabGuard 教师端 · 策略面板（只负责下发策略；改完点「保存并下发」）";
@@ -78,33 +89,41 @@ namespace LabGuardServer
 
             // ---------------- 顶部工具条
             var top = new Panel { Dock = DockStyle.Top, Height = 52, BackColor = Color.White, Padding = new Padding(10, 10, 10, 8) };
-            top.Controls.Add(new Label { Text = "搜索开关：", AutoSize = true, Left = 12, Top = 17 });
-            _search.SetBounds(92, 13, 230, 24);
+            top.Controls.Add(new Label { Text = "下发目标：", AutoSize = true, Left = 10, Top = 17 });
+            _target.SetBounds(78, 13, 190, 24);
+            _target.DropDownStyle = ComboBoxStyle.DropDownList;
+            _target.SelectedIndexChanged += (s, e) => { ReloadPolicyForTarget(); RebuildTree(); RebuildBody(); RefreshStatus(); };
+            top.Controls.Add(_target);
+            var manage = new Button { Text = "管理分组…", Width = 90, Height = 24, Left = 272, Top = 13, FlatStyle = FlatStyle.Flat };
+            manage.Click += (s, e) => { _openGroupsUi?.Invoke(); ReloadTargets(); };
+            top.Controls.Add(manage);
+            top.Controls.Add(new Label { Text = "搜索：", AutoSize = true, Left = 372, Top = 17 });
+            _search.SetBounds(414, 13, 190, 24);
             try { SendMessage(_search.Handle, EM_SETCUEBANNER, (IntPtr)1, "例如：USB、DNS、任务管理器、遮罩"); } catch { }
             _search.TextChanged += (s, e) => RebuildBody();
             top.Controls.Add(_search);
-            _onlyChanged.SetBounds(336, 16, 100, 22);
+            _onlyChanged.SetBounds(614, 16, 100, 22);
             _onlyChanged.CheckedChanged += (s, e) => RebuildBody();
             top.Controls.Add(_onlyChanged);
 
             Button save = MakeButton("保存并下发", 118, Color.FromArgb(0, 120, 215), Color.White);
-            save.SetBounds(444, 8, 118, 32);
+            save.SetBounds(716, 8, 118, 32);
             save.Click += (s, e) => SavePolicy();
             Button diff = MakeButton("看差异", 80, Color.White, Color.FromArgb(60, 60, 60));
-            diff.SetBounds(570, 9, 80, 30);
+            diff.SetBounds(840, 9, 70, 30);
             diff.Click += (s, e) => { FlushBindings(); ShowDiff(true); };
             Button pause = MakeButton("全员暂停", 92, Color.White, Color.FromArgb(60, 60, 60));
-            pause.SetBounds(658, 9, 92, 30);
+            pause.SetBounds(408, 9, 92, 30); pause.Top = 40;
             pause.Click += (s, e) => PauseAll(true);
             Button resume = MakeButton("全员恢复", 92, Color.White, Color.FromArgb(60, 60, 60));
-            resume.SetBounds(758, 9, 92, 30);
+            resume.SetBounds(506, 9, 92, 30); resume.Top = 40;
             resume.Click += (s, e) => PauseAll(false);
             var who = new Label
             {
                 Text = "教师端只下发策略；管控动作全部由学生机执行",
                 AutoSize = true, Left = 862, Top = 18, ForeColor = Color.FromArgb(120, 124, 130),
             };
-            _changedLabel.SetBounds(862, 32, 120, 18);
+            _changedLabel.SetBounds(900, 18, 120, 18);
             top.Controls.AddRange(new Control[] { save, diff, pause, resume, who, _changedLabel });
 
             // ---------------- 左栏：三层归属树
@@ -138,6 +157,8 @@ namespace LabGuardServer
             Controls.Add(bottom);
             Controls.Add(top);
 
+            ReloadTargets();
+            ReloadPolicyForTarget();
             RebuildTree();
             RebuildBody();
             RefreshStatus();
@@ -448,7 +469,20 @@ namespace LabGuardServer
                 : "当前 seq=" + v.Seq + (v.Paused ? " · 全员暂停中" : " · 管控中") +
                   " · 下发于 " + v.IssuedAtUtc.ToLocalTime().ToString("MM-dd HH:mm:ss");
             string online = _api != null ? (_api.Online.Snapshot().Length + " 台") : "—";
-            _status.Text = "  " + state + "    |    在线学生机 " + online + "    |    监听 " + (_api?.BoundPrefix ?? "—") +
+            string targetTxt = "";
+            DeviceGroup tg = TargetGroup();
+            if (tg != null && _api != null)
+            {
+                int want = tg.DeviceIds.Count + tg.Machines.Count;
+                int applied = 0;
+                foreach (CheckinRecord r in _api.Online.Snapshot())
+                {
+                    DeviceGroup owner = _groups.Resolve(r.DeviceId, r.Machine);
+                    if (owner != null && owner.Id == tg.Id && tg.Seq > 0 && r.AppliedSeq >= tg.Seq) applied++;
+                }
+                targetTxt = "    |    目标【" + tg.Name + "】" + want + " 台，已应用 " + applied + " 台";
+            }
+            _status.Text = "  " + state + targetTxt + "    |    在线学生机 " + online + "    |    监听 " + (_api?.BoundPrefix ?? "—") +
                            "    |    开关目录：客户端 v" + _catalog.ClientVersion + "（" + _catalog.Fields.Count + " 项，面板显示 " +
                            VisibleFields().Count() + " 项）";
         }
@@ -456,9 +490,21 @@ namespace LabGuardServer
         private void SavePolicy()
         {
             FlushBindings();
+            DeviceGroup target = TargetGroup();
             if (!ShowDiff(false)) return;
             try
             {
+                if (target != null)
+                {
+                    if (_publishGroup == null) { MessageBox.Show(this, "本界面不支持分组下发（请从托盘打开策略面板）。", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+                    ulong seq = _publishGroup(target, _policy, target.Paused);
+                    _published = Json.ParseObject(Json.Stringify(_policy));
+                    RebuildTree(); RebuildBody(); ReloadTargets(); RefreshStatus();
+                    Log.Info("已下发到组【" + target.Name + "】seq=" + seq);
+                    MessageBox.Show(this, "已下发到组【" + target.Name + "】（seq=" + seq + "）。\n该组设备默认 5 秒内生效，其他设备不受影响。",
+                        Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
                 bool paused = _store.Version()?.Paused ?? false;
                 PolicyVersion v = _store.Save(_policy, paused, _catalog.DefaultPolicyJson);
                 _published = Json.ParseObject(Json.Stringify(_policy));
@@ -513,6 +559,15 @@ namespace LabGuardServer
             try
             {
                 FlushBindings();
+                DeviceGroup target = TargetGroup();
+                if (target != null && _publishGroup != null)
+                {
+                    ulong seq = _publishGroup(target, _policy, paused);
+                    _published = Json.ParseObject(Json.Stringify(_policy));
+                    RebuildTree(); RebuildBody(); ReloadTargets(); RefreshStatus();
+                    Log.Info((paused ? "组暂停" : "组恢复") + "【" + target.Name + "】seq=" + seq);
+                    return;
+                }
                 _store.Save(_policy, paused, _catalog.DefaultPolicyJson);
                 _published = Json.ParseObject(Json.Stringify(_policy));
                 RebuildTree();
@@ -523,6 +578,64 @@ namespace LabGuardServer
             {
                 MessageBox.Show(this, "操作失败：" + ex.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+        }
+
+        // ---------------------------------------------------------------- 下发目标（v0.11 分组）
+
+        private sealed class TargetItem
+        {
+            public readonly string Key;      // null = 默认策略（全部设备）
+            private readonly string _text;
+            public TargetItem(string key, string text) { Key = key; _text = text; }
+            public override string ToString() { return _text; }
+        }
+
+        /// <summary>刷新「下发目标」：默认策略 + 各组（组名后带成员数与该组当前 seq）。</summary>
+        private void ReloadTargets()
+        {
+            string keep = CurrentTargetKey();
+            _target.BeginUpdate();
+            _target.Items.Clear();
+            _target.Items.Add(new TargetItem(null, "全部设备（默认策略）"));
+            if (_groups != null)
+                foreach (DeviceGroup g in _groups.Groups)
+                    _target.Items.Add(new TargetItem(g.Id, g.Name + "（" + (g.DeviceIds.Count + g.Machines.Count) +
+                                                           " 台 · seq " + g.Seq + "）"));
+            _target.EndUpdate();
+            int idx = 0;
+            for (int i = 0; i < _target.Items.Count; i++)
+                if (((TargetItem)_target.Items[i]).Key == keep) { idx = i; break; }
+            _target.SelectedIndex = idx;
+        }
+
+        private string CurrentTargetKey()
+        {
+            var it = _target.SelectedItem as TargetItem;
+            return it?.Key;
+        }
+
+        private DeviceGroup TargetGroup()
+        {
+            string k = CurrentTargetKey();
+            return (k == null || _groups == null) ? null : _groups.Get(k);
+        }
+
+        /// <summary>切换下发目标时，把面板载入该目标当前的策略（组没下发过 → 以默认策略为底稿）。</summary>
+        private void ReloadPolicyForTarget()
+        {
+            if (_catalog == null) return;
+            DeviceGroup g = TargetGroup();
+            Dictionary<string, object> basePolicy;
+            if (g != null && !string.IsNullOrEmpty(g.Envelope))
+            {
+                EnvelopeData d = PolicyEnvelope.ParseHeader(g.Envelope);
+                basePolicy = string.IsNullOrEmpty(d.PolicyJson)
+                    ? _store.CurrentOrDefaultPolicy(_catalog)
+                    : Json.ParseObject(d.PolicyJson);
+            }
+            else basePolicy = _store.CurrentOrDefaultPolicy(_catalog);
+            _policy = basePolicy;
+            _published = Json.ParseObject(Json.Stringify(_policy));
         }
 
         // ---------------------------------------------------------------- 截图（文档 / 人工核对）

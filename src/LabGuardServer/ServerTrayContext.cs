@@ -17,6 +17,10 @@ namespace LabGuardServer
         private ApiServer _api;
         private CatalogDoc _catalog;
         private NotifyIcon _tray;
+        private GroupStore _groups;
+
+        /// <summary>设备分组仓库（v0.11）。</summary>
+        public GroupStore Groups { get { return _groups; } }
 
         public ServerTrayContext()
         {
@@ -46,6 +50,8 @@ namespace LabGuardServer
             }
 
             _store = new PolicyStore(Program.DataDir, _keys);
+            _groups = new GroupStore(Program.DataDir);
+            _groups.Load();
             try
             {
                 _store.Load();
@@ -60,6 +66,7 @@ namespace LabGuardServer
             }
 
             _api = new ApiServer(_store, new OnlineList());
+            _api.Groups = _groups;      // v0.11：/api/version 与 /api/policy 按设备身份解析分组
             if (!_api.Start(ApiServer.DefaultPort))
             {
                 MessageBox.Show("HTTP 监听启动失败（端口 " + ApiServer.DefaultPort + " 被占用或无权限）。\n" +
@@ -78,11 +85,31 @@ namespace LabGuardServer
         public CatalogDoc Catalog => _catalog;
         public ApiServer Api => _api;
 
+        private GroupsForm _groupsForm;
+        internal void OpenGroupsForm()
+        {
+            if (_groupsForm == null || _groupsForm.IsDisposed)
+            {
+                _groupsForm = new GroupsForm(this);
+                _groupsForm.Show();
+            }
+            else _groupsForm.Activate();
+        }
+
+        /// <summary>给某个组签发并落盘策略（策略面板的「下发目标」用它）。</summary>
+        internal ulong PublishToGroup(DeviceGroup group, System.Collections.Generic.Dictionary<string, object> policy, bool paused)
+        {
+            ulong seq = GroupPublisher.Publish(_keys, group, policy, paused,
+                () => _store.Watermark, s => _store.MarkPublished(s));
+            _groups.Save();
+            return seq;
+        }
         private void BuildTray()
         {
             var menu = new ContextMenuStrip();
             menu.Items.Add("策略面板（需密码）", null, (s, e) => OpenPolicyForm());
             menu.Items.Add("在线学生机", null, (s, e) => OpenOnlineForm());
+            menu.Items.Add("设备分组…", null, (s, e) => OpenGroupsForm());
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("导出配对文件…", null, (s, e) => ExportPairing());
             menu.Items.Add(new ToolStripSeparator());
@@ -111,7 +138,7 @@ namespace LabGuardServer
             // 残留风险（学生碰到教师机就能改策略）与替代做法见 docs/deployment-guide.md「安全边界」。
             if (_policyForm == null || _policyForm.IsDisposed)
             {
-                _policyForm = new PolicyForm(_store, _catalog, _api);
+                _policyForm = new PolicyForm(_store, _catalog, _api, _groups, PublishToGroup, OpenGroupsForm);
                 _policyForm.Show();
             }
             else

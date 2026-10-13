@@ -7,6 +7,7 @@ using System.Net;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using LabGuardServer.Core.Envelope;
 using LabGuardServer.Core.Policy;
 using LabGuardServer.Core.Util;
 
@@ -35,6 +36,9 @@ namespace LabGuardServer.Core.Api
         public string BoundPrefix { get; private set; }
 
         public OnlineList Online => _online;
+
+        /// <summary>设备分组仓库（v0.11）：为空 = 不启用分组，人人拿默认策略（与 v0.10 行为一致）。</summary>
+        public GroupStore Groups { get; set; }
 
         public ApiServer(PolicyStore store, OnlineList online)
         {
@@ -112,12 +116,12 @@ namespace LabGuardServer.Core.Api
 
             if (path == "/api/version" && isGet)
             {
-                Respond(ctx, GetVersion(_store));
+                Respond(ctx, GetVersion(_store, Groups, Query(ctx, "device"), Query(ctx, "machine")));
                 return;
             }
             if (path == "/api/policy" && isGet)
             {
-                Respond(ctx, GetPolicy(_store));
+                Respond(ctx, GetPolicy(_store, Groups, Query(ctx, "device"), Query(ctx, "machine")));
                 return;
             }
             if (path == "/api/checkin" && method == "POST")
@@ -224,6 +228,54 @@ namespace LabGuardServer.Core.Api
             if (store?.CurrentEnvelope == null)
                 return new ApiReply { Status = 503, ContentType = "text/plain", Body = "policy not configured" };
             return new ApiReply { Status = 200, ContentType = "text/plain; charset=utf-8", Body = store.CurrentEnvelope };
+        }
+
+        /// <summary>GET /api/version（带设备身份）：命中分组的设备拿该组策略的版本，否则回落默认策略。</summary>
+        public static ApiReply GetVersion(PolicyStore store, GroupStore groups, string device, string machine)
+        {
+            DeviceGroup g = groups?.Resolve(device, machine);
+            if (g != null && !string.IsNullOrEmpty(g.Envelope)) return VersionOfEnvelope(g.Envelope);
+            return GetVersion(store);
+        }
+
+        /// <summary>GET /api/policy（带设备身份）：命中分组的设备拿该组信封，否则回落默认策略。</summary>
+        public static ApiReply GetPolicy(PolicyStore store, GroupStore groups, string device, string machine)
+        {
+            DeviceGroup g = groups?.Resolve(device, machine);
+            if (g != null && !string.IsNullOrEmpty(g.Envelope))
+                return new ApiReply { Status = 200, ContentType = "text/plain; charset=utf-8", Body = g.Envelope };
+            return GetPolicy(store);
+        }
+
+        /// <summary>查询参数（旧客户端不带 → 空 → 走默认策略，行为不变）。</summary>
+        private static string Query(HttpListenerContext ctx, string key)
+        {
+            try
+            {
+                string v = ctx.Request.QueryString[key];
+                if (string.IsNullOrEmpty(v)) return null;
+                return v.Length > 64 ? v.Substring(0, 64) : v;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>由信封原文算出 /api/version 应答（头部元数据 + 全文 SHA-256；不验签——它是我们自己签发的）。</summary>
+        public static ApiReply VersionOfEnvelope(string envelope)
+        {
+            EnvelopeData d = PolicyEnvelope.ParseHeader(envelope);
+            if (d.Seq == 0) return new ApiReply { Status = 503, ContentType = "text/plain", Body = "policy not configured" };
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+            {
+                string hex = BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(envelope)))
+                    .Replace("-", "").ToLowerInvariant();
+                return new ApiReply
+                {
+                    Status = 200,
+                    ContentType = "application/json",
+                    Body = "{\"seq\":" + d.Seq + ",\"sha256\":\"" + hex + "\",\"paused\":" +
+                           (d.Paused ? "true" : "false") + "}",
+                };
+            }
         }
 
         /// <summary>POST /api/checkin：解析心跳、限速、聚合在线列表。字段类型严格校验（红队 A1-9：类型错乱必须 400 不能 500）。</summary>

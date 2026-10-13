@@ -95,6 +95,36 @@ namespace LabGuardServer.Core.Envelope
             return candidateSeq > appliedSeq;
         }
 
+        /// <summary>
+        /// 只解析信封头部字段（魔数 / seq / issuedAt / paused / policyJson），**不做验签**。
+        /// 用途：服务端展示"自己签发过的"信封元数据（分组策略的 seq / 下发时间）。
+        /// 需要信任判断时仍必须走 <see cref="Parse"/>（验签）；这里的结果只当元数据用。
+        /// </summary>
+        public static EnvelopeData ParseHeader(string envelope)
+        {
+            var d = new EnvelopeData { Verified = false };
+            if (string.IsNullOrEmpty(envelope)) return d;
+            if (envelope.IndexOf(Magic + "|", StringComparison.Ordinal) != 0) return d;
+            int p1 = envelope.IndexOf('|');
+            int p2 = p1 < 0 ? -1 : envelope.IndexOf('|', p1 + 1);
+            int p3 = p2 < 0 ? -1 : envelope.IndexOf('|', p2 + 1);
+            int p4 = p3 < 0 ? -1 : envelope.IndexOf('|', p3 + 1);
+            if (p4 < 0) return d;
+            int pSig = envelope.LastIndexOf('|');
+            if (pSig <= p4) return d;
+            if (!ulong.TryParse(envelope.Substring(p1 + 1, p2 - p1 - 1), NumberStyles.None,
+                    CultureInfo.InvariantCulture, out d.Seq)) { d.Seq = 0; return d; }
+            DateTime when;
+            if (!DateTime.TryParse(envelope.Substring(p2 + 1, p3 - p2 - 1), CultureInfo.InvariantCulture,
+                    DateTimeStyles.RoundtripKind, out when)) return d;
+            d.IssuedAtUtc = when;
+            string pausedField = envelope.Substring(p3 + 1, p4 - p3 - 1);
+            if (pausedField != "0" && pausedField != "1") return d;
+            d.Paused = pausedField == "1";
+            d.PolicyJson = envelope.Substring(p4 + 1, pSig - p4 - 1);
+            return d;
+        }
+
         internal static byte[] Sign(RSA rsa, string payload)
         {
             return rsa.SignData(Encoding.UTF8.GetBytes(payload), HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);

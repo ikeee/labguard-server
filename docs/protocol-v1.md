@@ -57,6 +57,9 @@ LGSRV1|<seq>|<issuedAt>|<paused>|<policyJson>|<signature>
 |---|---|---|---|
 | `GET /api/version` | — | `{"seq":123,"sha256":"…","paused":false}` | 轻量探测：客户端对比 seq/sha，无变化不拉全文；`paused` 供托盘/面板展示。`sha256` = **信封全文的 SHA-256**，客户端可直接用作完整性 pin |
 | `GET /api/policy` | — | `text/plain; charset=utf-8`：LGSRV1 信封全文 | 全量策略下发 |
+
+> **v0.11 分组**：`/api/version` 与 `/api/policy` 支持两个**可选**查询参数
+> `device=<deviceId>` 与 `machine=<机器名>`（见 §3.2）。都不带 → 默认策略（与旧版行为完全一致）。
 | `POST /api/checkin` | `{"machine":"PC-01","version":"0.10.4","seq":123,"paused":false,"deviceId":"LG-1a2b…","appliedSeq":123,"status":"ok"}` | `{"ok":true}` | 心跳上报；服务端聚合出在线学生机列表与**每台设备的策略应用状态**（默认 60s 无心跳判离线） |
 
 - 编码：请求体按 `Content-Encoding`（缺省 UTF-8）解码；响应一律 UTF-8
@@ -133,3 +136,22 @@ LGSRV1|<seq>|<issuedAt>|<paused>|<policyJson>|<signature>
 
 - 客户端遇到**不认识的魔数**（如未来 LGSRV2）：拒绝该信封，保持现有策略，日志告警——绝不因协议升级失控。
 - 服务端遇客户端上报的 `version` 高于自己：在在线列表标注「客户端更新」，不拒绝服务。
+### 3.2 设备分组（v0.11）
+
+**模型**：组 = `{ 组名, 成员(deviceId 列表 + 机器名列表), 该组的策略信封, 该组 seq }`。
+**默认组不建实体** —— 它就是 `policy.envelope`；其它组是**覆盖层**（命中组的设备拿该组信封，否则拿默认信封）。
+
+**解析规则**（服务端 `GroupStore.Resolve`，口径确定、可测）：
+
+1. `device` 精确命中某组成员 → 用该组；
+2. 否则 `machine` 精确命中某组成员 → 用该组（兼容旧客户端/临时指定）；
+3. 都不中 → 默认策略。
+   一台设备**只属于一个主组**（入组会自动从原组移走）。
+
+**全局序号单调（关键约束）**：`seq` 在**所有组之间共享一个计数器**——每次发布（无论哪个组）都取
+`max(全局水位, 本组 seq) + 1` 并推进水位。原因：客户端的防回滚是"seq 必须严格大于已应用值"，
+若每组各自计数，设备调组就会拿到更小的 seq 而被**正确拒绝**（表现为"调了组却不生效"）。
+
+**目标与确认**：教师端显示"目标 N 台 / 已应用 M 台"（用 checkin 上报的 `appliedSeq` 与组 seq 比较）。
+删除组 → 组内设备回到默认策略；已下发的组信封一并丢弃。
+

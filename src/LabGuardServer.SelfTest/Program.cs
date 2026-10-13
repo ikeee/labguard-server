@@ -554,6 +554,74 @@ namespace LabGuardServer.SelfTest
                 Check(ApiServer.Checkin("{\"machine\":\"PC-BAD\",\"deviceId\":\"" + new string('d', 65) + "\"}", "10.1.2.6", online2, devRate, t5).Status == 400,
                     "10.16 deviceId 超长（>64）→ 400");
                 Check(online2.Count >= 5, "10.17 登记设备数含离线（含旧客户端按机器名兜底）", online2.Count + " 台");
+
+                // ================================================================ [11] 设备分组（v0.11）
+                // 口径：默认组 = policy.envelope（不变）；非默认组是覆盖层；
+                // 解析 = deviceId 精确 → 机器名精确 → 未命中回落默认；seq 在所有组之间**全局单调**
+                // （否则设备调组会拿到更小 seq 而被客户端正确拒绝，表现为"调了组却不生效"）。
+                Console.WriteLine("[11] 设备分组（解析 / 按组下发 / 全局序号 / 持久化）");
+                string grpDir = Path.Combine(tmp, "groups");
+                Directory.CreateDirectory(grpDir);
+                var grpStore = new PolicyStore(grpDir, keys);
+                grpStore.Load();
+                grpStore.Save(catalog != null ? Json.ParseObject(catalog.DefaultPolicyJson) : new Dictionary<string, object>(),
+                    false, catalog?.DefaultPolicyJson);           // 默认组 seq=1
+                var groups = new GroupStore(grpDir);
+                groups.Load();
+
+                Check(ApiServer.GetVersion(grpStore, groups, null, null).Body == ApiServer.GetVersion(grpStore).Body,
+                    "11.1 没有任何组 / 不带身份 → 与默认策略完全一致（v0.10 行为不变）");
+
+                DeviceGroup gA = groups.Add("高一(3)班机房");
+                DeviceGroup gB = groups.Add("信息学考试机房");
+                Check(groups.Groups.Count == 2 && groups.Groups.All(g => g.Id.StartsWith("g-")),
+                    "11.2 新建组（自动分配 g- 开头 ID）");
+
+                groups.Assign(gA.Id, "LG-aaaa000011112222", "PC-101");
+                Check(groups.Resolve("LG-aaaa000011112222", "别的名字") == gA,
+                    "11.3 按 deviceId 精确命中（机器名不同也认得）");
+                Check(groups.Resolve(null, "PC-101") == gA, "11.4 旧客户端按机器名兜底命中");
+                Check(groups.Resolve("LG-9999", "PC-999") == null, "11.5 都不命中 → 回落默认策略");
+
+                groups.Assign(gB.Id, "LG-aaaa000011112222", "PC-101");
+                Check(groups.Resolve("LG-aaaa000011112222", "PC-101") == gB && gA.DeviceIds.Count == 0,
+                    "11.6 一台设备只属于一个主组（调组会自动从原组移走）");
+
+                // 按组下发：seq 必须比默认组大（全局单调）
+                var grpPolicy = catalog != null ? Json.ParseObject(catalog.DefaultPolicyJson) : new Dictionary<string, object>();
+                PathAccess.Set(grpPolicy, "StartDelaySeconds", 999);
+                ulong seqA = GroupPublisher.Publish(keys, gB, grpPolicy, false, () => grpStore.Watermark, s => grpStore.MarkPublished(s));
+                Check(seqA == 2, "11.7 组下发拿到全局下一个 seq（默认组 1 → 组 2）", "seq=" + seqA);
+                Check(!string.IsNullOrEmpty(gB.Envelope) && gB.Seq == seqA, "11.7 组信封已生成并记录 seq");
+
+                ApiServer.ApiReply groupVer = ApiServer.GetVersion(grpStore, groups, "LG-aaaa000011112222", "PC-101");
+                Check(groupVer.Status == 200 && groupVer.Body.Contains("\"seq\":2"),
+                    "11.8 带身份请求 → 返回该组策略的版本", groupVer.Body);
+                ApiServer.ApiReply groupPol = ApiServer.GetPolicy(grpStore, groups, "LG-aaaa000011112222", "PC-101");
+                Check(groupPol.Status == 200 && groupPol.Body == gB.Envelope, "11.8 带身份请求 → 拿到该组信封原文");
+                Check(ApiServer.GetPolicy(grpStore, groups, null, "PC-999").Body == grpStore.CurrentEnvelope,
+                    "11.8 未命中组的设备 → 仍拿默认信封");
+
+                // 再发默认组：seq 必须比组 seq 大（否则组设备会拒收默认策略）
+                PolicyVersion def2 = grpStore.Save(grpPolicy, false, catalog?.DefaultPolicyJson);
+                Check(def2.Seq > seqA, "11.9 之后发布默认组 → seq 继续增大（跨组全局单调）",
+                    "默认 seq=" + def2.Seq + " > 组 seq=" + seqA);
+
+                // 持久化往返
+                groups.Save();
+                var groupsReloaded = new GroupStore(grpDir);
+                groupsReloaded.Load();
+                DeviceGroup rB = groupsReloaded.Get(gB.Id);
+                Check(groupsReloaded.Groups.Count == 2 && rB != null && rB.Name == "信息学考试机房" &&
+                      rB.Envelope == gB.Envelope && rB.Seq == gB.Seq && rB.DeviceIds.Count == 1 &&
+                      rB.Machines.Count == 1,
+                    "11.10 分组持久化：名称/成员/信封/seq 往返一致（schemaVersion=1）");
+
+                // 删组 → 设备回默认
+                groupsReloaded.Remove(gB.Id);
+                Check(groupsReloaded.Resolve("LG-aaaa000011112222", "PC-101") == null, "11.11 删组后设备回到默认策略");
+                Check(groupsReloaded.GroupNameOf("LG-aaaa000011112222", "PC-101") == GroupStore.DefaultGroupName,
+                    "11.11 组名显示回落为「" + GroupStore.DefaultGroupName + "」");
             }
         }
 

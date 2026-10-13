@@ -132,6 +132,17 @@ namespace LabGuardServer.Core.Policy
             }
         }
 
+        /// <summary>
+        /// 把"已发布过的最大 seq"推进到给定值。用于**分组发布**：组的信封由 GroupPublisher 直接签发，
+        /// 不走本类的 Save，但必须把全局水位一起抬高——否则默认组下次保存可能生成一个
+        /// 比学生机已应用值更小的 seq（被正确拒绝，表现为"改了策略却没生效"）。
+        /// </summary>
+        public void MarkPublished(ulong seq)
+        {
+            if (seq <= CurrentSeq) { SaveWatermark(seq); return; }
+            CurrentSeq = seq;
+            SaveWatermark(seq);
+        }
         /// <summary>当前策略字典（编辑面板的底稿）。没保存过 → 目录默认值。</summary>
         public Dictionary<string, object> CurrentOrDefaultPolicy(Catalog.CatalogDoc catalog)
         {
