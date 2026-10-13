@@ -35,3 +35,40 @@ jobs:
       - name: 协议端到端冒烟
         shell: pwsh
         run: ./scripts/e2e-headless.ps1 -Port 8211 -Seconds 15 -SkipBuild
+
+  e2e-testbed:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: labguard-server
+
+      # 测试台要**真客户端进程**，所以把客户端仓库并排签出（与本地 D:\YIN-PROJE\ 下的目录布局一致）
+      - uses: actions/checkout@v7
+        with:
+          repository: ikeee/labguard
+          path: labguard-client
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '8.0.x'
+
+      # 安全闸：先证明"沙箱不碰真机"，再跑场景（runner 是一次性虚拟机，但口径与真机一致）
+      - name: 沙箱隔离验真（安全闸）
+        shell: pwsh
+        run: ./labguard-server/scripts/verify-sandbox.ps1 -ClientRepo ./labguard-client -Seconds 8
+
+      # 端到端场景：1 个真教师端 + 3 个真学生端沙箱 + 克隆检测，21 项断言
+      - name: 端到端场景套件
+        shell: pwsh
+        run: ./labguard-server/scripts/testbed-clients.ps1 -ClientRepo ./labguard-client -SkipBuild -SkipIsolationGate -Port 8231
+
+      - name: 失败时附上日志
+        if: failure()
+        shell: pwsh
+        run: |
+          Get-ChildItem $env:TEMP -Filter 'lg-*' -Directory | ForEach-Object {
+            Write-Host "== $($_.FullName) =="
+            Get-ChildItem $_.FullName -Recurse -File -Include *.log,*.json,*.err |
+              Select-Object -First 40 | ForEach-Object { Write-Host "--- $($_.FullName)"; Get-Content $_.FullName -Encoding UTF8 -Tail 30 }
+          }

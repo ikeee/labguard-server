@@ -8,6 +8,7 @@
 - **部署指南：[docs/deployment-guide.md](docs/deployment-guide.md)**（教师机 3 分钟 / 学生机 1 分钟，含无人值守与排障）
 - 许可：MIT（见 [LICENSE](LICENSE)）· 更新记录：[CHANGELOG.md](CHANGELOG.md) · 通信协议：[docs/protocol-v1.md](docs/protocol-v1.md)
 - 开发文档：[开发基线](docs/development-baseline.md) · [协议实现对照审计](docs/protocol-conformance.md) · [接手开发执行计划](docs/development-plan.md)
+- 端到端测试台（**一台机器跑 1 个真教师端 + N 个真学生端沙箱**）：[docs/e2e-testbed.md](docs/e2e-testbed.md)
 
 ## 是什么
 
@@ -58,6 +59,29 @@ LabGuardServer.exe --headless --data-dir D:\lg-test --port 8210 ^
 `--export-pairing <文件>` 导出配对文件（给了它且没给 `--headless` 就只导出后退出）；
 `--seconds N` 跑够 N 秒自动退出（测试用），省略则一直跑到 Ctrl+C。
 省略 `--bind-all` 时只监听 127.0.0.1（不需要 URLACL）。
+
+分组（v0.11，同样是"只改磁盘、运行中的服务端热拾取"）：
+
+```bat
+LabGuardServer.exe --data-dir D:\lg-test --add-group 机房A --assign 机房A=LG-xxxx ^
+    --group-policy 机房A=D:\lg-test\group-a.json
+LabGuardServer.exe --data-dir D:\lg-test --pause-default
+LabGuardServer.exe --data-dir D:\lg-test --resume-default
+```
+
+`--assign 组名=<deviceId 或以 LG- 开头则按 ID、否则按机器名>`；`--group-policy 组名=<策略.json>`
+立刻签发该组信封并把全局 seq 推进一步。跑完（或 Ctrl+C 退出）会打印**设备清单**：
+`机器名 dev=设备ID v版本 seq=已下发 applied=已应用 status=ok|error state=状态 group=所属组`。
+
+## 端到端测试台（改客户端/服务端之后必跑）
+
+```powershell
+powershell -File scripts\verify-sandbox.ps1       # 安全闸：证明沙箱不碰真机（约 25 秒）
+powershell -File scripts\testbed-clients.ps1      # 21 项场景：真教师端 + 3 个真学生端沙箱（约 4 分钟）
+```
+
+细节与场景矩阵见 [docs/e2e-testbed.md](docs/e2e-testbed.md)。**先跑安全闸**——沙箱没有真正隔离时，
+场景里的"学生端"会按真策略改掉开发机（2026-10-13 就是这么踩的）。
 
 协议端到端冒烟（会自己起服务端、用**独立实现**核对 15 项契约、检查完自动收尾）：
 

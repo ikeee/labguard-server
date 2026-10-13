@@ -233,6 +233,9 @@ namespace LabGuardServer.Core.Api
         /// <summary>GET /api/version（带设备身份）：命中分组的设备拿该组策略的版本，否则回落默认策略。</summary>
         public static ApiReply GetVersion(PolicyStore store, GroupStore groups, string device, string machine)
         {
+            // 每次解析前先看分组文件有没有变（内部只比时间戳，没变立刻返回；变了才重读）。
+            // 不依赖 FileSystemWatcher 的投递：脚本刚写完 groups.json 就要能马上生效，测试才可重复。
+            if (groups != null) groups.TryReloadFromDisk();
             DeviceGroup g = groups?.Resolve(device, machine);
             if (g != null && !string.IsNullOrEmpty(g.Envelope)) return VersionOfEnvelope(g.Envelope);
             return GetVersion(store);
@@ -241,6 +244,7 @@ namespace LabGuardServer.Core.Api
         /// <summary>GET /api/policy（带设备身份）：命中分组的设备拿该组信封，否则回落默认策略。</summary>
         public static ApiReply GetPolicy(PolicyStore store, GroupStore groups, string device, string machine)
         {
+            if (groups != null) groups.TryReloadFromDisk();
             DeviceGroup g = groups?.Resolve(device, machine);
             if (g != null && !string.IsNullOrEmpty(g.Envelope))
                 return new ApiReply { Status = 200, ContentType = "text/plain; charset=utf-8", Body = g.Envelope };

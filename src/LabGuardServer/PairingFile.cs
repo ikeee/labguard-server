@@ -24,13 +24,22 @@ namespace LabGuardServer
             public string generatedAt;
         }
 
-        public static PairingDoc Build(string publicKeyXml, string fingerprint, int port)
+        /// <summary>
+        /// 生成配对文件。<paramref name="addressOverride"/> 非空时**只用这一个地址**（不列本机各网卡）。
+        ///
+        /// 用途：单机端到端测试台。学生端只会连 `addresses[0]`，而本机 IPv4 列表里**不含回环**，
+        /// 于是"服务端只监听 127.0.0.1"时学生端永远连不上（必须先绑 `+`，而绑 `+` 要管理员/URLACL）。
+        /// 测试台用 `--pairing-address 127.0.0.1` 就能免提权跑通；正式部署仍用各网卡地址。
+        /// </summary>
+        public static PairingDoc Build(string publicKeyXml, string fingerprint, int port, string addressOverride = null)
         {
             return new PairingDoc
             {
                 format = "labguard-pairing/1",
                 serverHost = Dns.GetHostName(),
-                addresses = LocalIpv4Addresses(),
+                addresses = string.IsNullOrWhiteSpace(addressOverride)
+                    ? LocalIpv4Addresses()
+                    : new[] { addressOverride.Trim() },
                 port = port,
                 publicKeyXml = publicKeyXml,
                 fingerprint = fingerprint,

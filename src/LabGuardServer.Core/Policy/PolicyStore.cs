@@ -33,11 +33,23 @@ namespace LabGuardServer.Core.Policy
         private readonly RsaKeyStore _keys;
 
         /// <summary>
-        /// 已发布过的**最大 seq**（水位）。它是防"重启后 seq 回退"的关键：
-        /// 磁盘信封被换成一份**签名合法的旧信封**时，光靠验签是查不出来的，
-        /// 必须拿水位比对（执行计划 §B2 不变量 8）。
+        /// **全局分配水位**：所有组（含默认组）共享的"已发布过的最大 seq"。
+        /// 它是"绝不重复使用同一个 seq"的保证——两个进程/两个组同时发布也不会撞号。
+        /// 存于 <c>seq.highwater</c> 的 <c>seq</c> 字段。
         /// </summary>
         public ulong Watermark { get; private set; }
+
+        /// <summary>
+        /// **默认组自己的水位**：默认策略信封历次保存所达到的最大 seq（<c>seq.highwater</c> 的
+        /// <c>defaultSeq</c> 字段）。
+        ///
+        /// 为什么必须与 <see cref="Watermark"/> 分开（2026-10-13 实测踩坑）：
+        /// 只要发布过**任何**一个组的策略，全局水位就会被抬到那个组的 seq；而磁盘上的
+        /// `policy.envelope`（默认组）seq 天然落后。若仍拿全局水位当默认信封的回滚下限，
+        /// 那么"发布过分组策略之后"任何一次重启/换进程（CLI、无人值守脚本）都会**拒绝加载默认信封**，
+        /// 表现为整个教师端 503、默认策略凭空消失。回滚下限只应该跟"默认组自己的历史最大值"比。
+        /// </summary>
+        public ulong DefaultWatermark { get; private set; }
 
         public PolicyStore(string dataDir, RsaKeyStore keys)
         {
@@ -58,7 +70,7 @@ namespace LabGuardServer.Core.Policy
         /// </summary>
         public void Load(ulong? minSeq = null)
         {
-            Watermark = LoadWatermark();     // 先读水位：它比磁盘信封更可信（信封可被人换成旧的一份）
+            LoadWatermarks();                // 先读水位：它比磁盘信封更可信（信封可被人换成旧的一份）
             if (!File.Exists(PolicyPath))
             {
                 CurrentEnvelope = null;
@@ -70,13 +82,13 @@ namespace LabGuardServer.Core.Policy
             EnvelopeData d = PolicyEnvelope.Parse(raw, _keys.Rsa);
             if (!d.Verified)
                 throw new InvalidDataException("策略信封验签失败（policy.envelope 疑似被篡改）——拒绝加载，请人工检查 " + PolicyPath);
-            ulong floor = Math.Max(minSeq ?? 0, Watermark);
+            ulong floor = Math.Max(minSeq ?? 0, DefaultWatermark);
             if (floor > 0 && d.Seq < floor)
                 throw new InvalidDataException("拒绝回滚：磁盘信封 seq=" + d.Seq + " 低于已发布水位/下限 " + floor +
                     "（签名虽合法，但它是旧版本信封——放行会让 seq 回退）");
             CurrentEnvelope = raw;
             CurrentSeq = d.Seq;
-            SaveWatermark(Math.Max(Watermark, d.Seq));
+            SaveWatermark(Math.Max(Watermark, d.Seq), Math.Max(DefaultWatermark, d.Seq));
         }
 
         /// <summary>
@@ -97,12 +109,15 @@ namespace LabGuardServer.Core.Policy
                     throw new ArgumentNullException(nameof(defaultPolicyJsonForReset));
                 json = defaultPolicyJsonForReset;
             }
-            ulong seq = Math.Max(CurrentSeq, Watermark) + 1;   // 永不重复使用已发布过的 seq
+            // 先跟磁盘对一次全局水位：**另一个进程**可能刚发布过（CLI/脚本/管理端），
+            // 本进程内存里的水位偏小就会分配出已用过的 seq（学生端按"严格大于已应用"拒收 → 改了不生效）。
+            RefreshWatermarksFromDisk();
+            ulong seq = Math.Max(CurrentSeq, Math.Max(Watermark, DefaultWatermark)) + 1;   // 永不重复使用已发布过的 seq
             string envelope = PolicyEnvelope.Build(seq, DateTime.UtcNow, paused, json, _keys.Rsa);
             AtomicFile.WriteAllText(PolicyPath, envelope);
             CurrentEnvelope = envelope;
             CurrentSeq = seq;
-            SaveWatermark(seq);
+            SaveWatermark(seq, seq);
             return Version();
         }
 
@@ -139,9 +154,10 @@ namespace LabGuardServer.Core.Policy
         /// </summary>
         public void MarkPublished(ulong seq)
         {
-            if (seq <= CurrentSeq) { SaveWatermark(seq); return; }
-            CurrentSeq = seq;
-            SaveWatermark(seq);
+            RefreshWatermarksFromDisk();      // 同上：多人/多进程发布时防撞号
+            if (seq > CurrentSeq) CurrentSeq = seq;
+            // 只推进**全局**水位；默认组的回滚下限（DefaultWatermark）不动——组发布不代表默认信封变新
+            SaveWatermark(seq, DefaultWatermark);
         }
         /// <summary>当前策略字典（编辑面板的底稿）。没保存过 → 目录默认值。</summary>
         public Dictionary<string, object> CurrentOrDefaultPolicy(Catalog.CatalogDoc catalog)
@@ -214,7 +230,9 @@ namespace LabGuardServer.Core.Policy
                     Log.Error("磁盘策略信封验签失败，拒绝加载（保留现行策略）：" + PolicyPath);
                     return false;
                 }
-                ulong floor = Math.Max(Watermark, CurrentSeq);
+                // 下限用**默认组水位**（不是全局水位：组发布会把全局水位抬高，
+                // 用它当默认信封的下限会让合法的默认信封热拾取被永久拦住）
+                ulong floor = Math.Max(DefaultWatermark, CurrentSeq);
                 if (d.Seq < floor)
                 {
                     Log.Error("磁盘策略 seq=" + d.Seq + " 低于现行/水位 " + floor +
@@ -223,7 +241,7 @@ namespace LabGuardServer.Core.Policy
                 }
                 CurrentEnvelope = disk;
                 CurrentSeq = d.Seq;
-                SaveWatermark(Math.Max(Watermark, d.Seq));
+                SaveWatermark(Math.Max(Watermark, d.Seq), Math.Max(DefaultWatermark, d.Seq));
                 Log.Info("已拾取磁盘上的新策略：seq=" + d.Seq);
                 return true;
             }
@@ -258,15 +276,16 @@ namespace LabGuardServer.Core.Policy
         }
 
         /// <summary>
-        /// 读水位（<c>seq.highwater</c>，格式 <c>{"schemaVersion":1,"seq":N}</c>）。
+        /// 读水位文件 <c>seq.highwater</c>：<c>{"schemaVersion":1,"seq":全局,"defaultSeq":默认组}</c>。
+        /// `defaultSeq` 缺失（旧文件）→ 按等于 `seq` 处理（旧行为就是"单一水位"）。
         /// 缺失 / 损坏 / schemaVersion 不认识 → 按 0 处理并告警（不抛异常：降级为"无回退保护"，
         /// 也不影响本次启动——但下次 Save 一定基于内存里的 CurrentSeq，不会倒着走）。
         /// </summary>
-        private ulong LoadWatermark()
+        private void LoadWatermarks()
         {
             try
             {
-                if (!File.Exists(WatermarkPath)) return 0;
+                if (!File.Exists(WatermarkPath)) { Watermark = 0; DefaultWatermark = 0; return; }
                 Dictionary<string, object> doc = Json.ParseObject(File.ReadAllText(WatermarkPath, Encoding.UTF8));
                 if (doc == null) throw new InvalidDataException("水位文件不是 JSON 对象");
                 int schema = doc.TryGetValue("schemaVersion", out object s) && s is IConvertible
@@ -274,23 +293,59 @@ namespace LabGuardServer.Core.Policy
                 if (schema != 1) throw new InvalidDataException("水位文件 schemaVersion 不认识：" + schema);
                 if (!doc.TryGetValue("seq", out object v) || v == null)
                     throw new InvalidDataException("水位文件缺少 seq");
-                return Convert.ToUInt64(v);
+                ulong global = Convert.ToUInt64(v);
+                Watermark = global;
+                DefaultWatermark = doc.TryGetValue("defaultSeq", out object dv) && dv != null
+                    ? Convert.ToUInt64(dv) : global;
             }
             catch (Exception ex)
             {
                 Log.Warn("seq 水位文件不可用，按 0 处理（重启防回退保护降级）：" + ex.Message);
-                return 0;
+                Watermark = 0;
+                DefaultWatermark = 0;
             }
         }
 
-        private void SaveWatermark(ulong seq)
+        /// <summary>
+        /// 与磁盘上的水位对齐（**只升不降**）。多进程场景（CLI/脚本/管理端各是一个进程）在
+        /// "分配新 seq 之前"必须先调用，否则会分配出别人已经用过的 seq。
+        /// 读失败一律保留内存值——宁可少一次提升，也不能因为读失败反而把保护降下去。
+        /// </summary>
+        private void RefreshWatermarksFromDisk()
         {
-            if (seq <= Watermark) return;
+            ulong g = Watermark, d = DefaultWatermark;
+            try
+            {
+                if (!File.Exists(WatermarkPath)) return;
+                Dictionary<string, object> doc = Json.ParseObject(File.ReadAllText(WatermarkPath, Encoding.UTF8));
+                if (doc == null) return;
+                if (doc.TryGetValue("seq", out object v) && v is IConvertible) g = Math.Max(g, Convert.ToUInt64(v));
+                if (doc.TryGetValue("defaultSeq", out object dv) && dv is IConvertible) d = Math.Max(d, Convert.ToUInt64(dv));
+            }
+            catch { }
+            Watermark = g;
+            DefaultWatermark = d;
+        }
+
+        /// <summary>
+        /// 取一个**已与磁盘对齐**的全局水位。<see cref="GroupPublisher"/> 的 watermarkReader 用这个
+        /// （直接读 <see cref="Watermark"/> 属性会在多进程下拿到过期值）。
+        /// </summary>
+        public ulong RefreshWatermark()
+        {
+            RefreshWatermarksFromDisk();
+            return Watermark;
+        }
+
+        private void SaveWatermark(ulong globalSeq, ulong defaultSeq)
+        {
+            if (globalSeq > Watermark) Watermark = globalSeq;
+            if (defaultSeq > DefaultWatermark) DefaultWatermark = defaultSeq;
             try
             {
                 AtomicFile.WriteAllText(WatermarkPath,
-                    "{\"schemaVersion\":1,\"seq\":" + seq.ToString(System.Globalization.CultureInfo.InvariantCulture) + "}");
-                Watermark = seq;
+                    "{\"schemaVersion\":1,\"seq\":" + Watermark.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                    ",\"defaultSeq\":" + DefaultWatermark.ToString(System.Globalization.CultureInfo.InvariantCulture) + "}");
             }
             catch (Exception ex)
             {

@@ -34,6 +34,10 @@ namespace LabGuardServer.Core.Policy
         public const string DefaultGroupName = "全部设备（默认策略）";
         private const string FileName = "groups.json";
 
+        private readonly object _sync = new object();
+        private FileSystemWatcher _watcher;
+        private DateTime _diskStampUtc = DateTime.MinValue;
+
         /// <summary>数据目录（自检注入临时目录用）。</summary>
         public string DataDir { get; set; }
         public string GroupsPath { get { return Path.Combine(DataDir, FileName); } }
@@ -47,40 +51,161 @@ namespace LabGuardServer.Core.Policy
 
         public void Load()
         {
-            Groups = new List<DeviceGroup>();
+            lock (_sync)
+            {
+                Groups = ReadFromDisk();
+                _diskStampUtc = StampOfDisk();
+            }
+        }
+
+        /// <summary>
+        /// 盯住 <c>groups.json</c>：**外部（CLI/脚本/无人值守）改的分组也要能被运行中的服务端拾取**。
+        ///
+        /// 与 <see cref="PolicyStore.StartWatching"/> 同一个设计理由（2026-10-13 实测踩坑）：
+        /// 分组只在启动时读一次的话，"脚本给运行中的教师端加组/调组"就没有任何效果——
+        /// 磁盘上新组已存在、HTTP 还按老分组解析，表现为"分组命令执行成功但设备没换策略"。
+        /// </summary>
+        public void StartWatching()
+        {
+            if (_watcher != null) return;
             try
             {
-                if (!File.Exists(GroupsPath)) return;
-                var doc = new JavaScriptSerializer { MaxJsonLength = 8 * 1024 * 1024 }
-                    .Deserialize<Dictionary<string, object>>(File.ReadAllText(GroupsPath, Encoding.UTF8));
-                if (doc == null) return;
-                int schema = doc.TryGetValue("schemaVersion", out object sv) && sv is IConvertible ? Convert.ToInt32(sv) : 0;
-                if (schema != 1) { Log.Warn("分组文件 schemaVersion 不认识（" + schema + "），按空分组处理"); return; }
-                if (!(doc.TryGetValue("groups", out object groupsObj) && groupsObj is System.Collections.IEnumerable en)) return;
-                foreach (object o in en)
+                Directory.CreateDirectory(DataDir);
+                _watcher = new FileSystemWatcher(DataDir, FileName)
                 {
-                    var m = o as Dictionary<string, object>;
-                    if (m == null) continue;
-                    var g = new DeviceGroup
+                    NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName,
+                    EnableRaisingEvents = true,
+                };
+                _watcher.Changed += (s, e) => TryReloadFromDisk();
+                _watcher.Created += (s, e) => TryReloadFromDisk();
+                _watcher.Renamed += (s, e) => TryReloadFromDisk();
+                _watcher.Deleted += (s, e) => TryReloadFromDisk();
+                Log.Info("已盯住分组文件（外部改的分组会被自动拾取）：" + GroupsPath);
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("启动分组文件监视失败（只能靠重启拾取外部改动）：" + ex.Message);
+                _watcher = null;
+            }
+        }
+
+        public void StopWatching()
+        {
+            try { if (_watcher != null) { _watcher.EnableRaisingEvents = false; _watcher.Dispose(); } } catch { }
+            _watcher = null;
+        }
+
+        /// <summary>尝试从磁盘拾取更新的分组。返回 true = 内存里的分组确实变了。</summary>
+        public bool TryReloadFromDisk()
+        {
+            lock (_sync)
+            {
+                try
+                {
+                    if (!File.Exists(GroupsPath))
                     {
-                        Id = Str(m, "id"),
-                        Name = Str(m, "name"),
-                        Envelope = Str(m, "envelope"),
-                        IssuedAtUtc = Str(m, "issuedAtUtc"),
-                        Paused = Bool(m, "paused"),
-                        Seq = Ulong(m, "seq"),
-                    };
-                    if (string.IsNullOrEmpty(g.Id) || string.IsNullOrEmpty(g.Name)) continue;
-                    g.DeviceIds = StrList(m, "deviceIds");
-                    g.Machines = StrList(m, "machines");
-                    Groups.Add(g);
+                        // 从没见过文件（比如自检里纯内存改的组、还没 Save）→ 什么都没变，**不能**把内存里的组清掉
+                        if (_diskStampUtc == DateTime.MinValue) return false;
+                        // 见过文件、现在没了 → 是外部删的，跟着回退到"无分组"
+                        Groups = new List<DeviceGroup>();
+                        _diskStampUtc = DateTime.MinValue;
+                        Log.Info("分组文件已不存在 → 全部设备回默认策略");
+                        return true;
+                    }
+                    // Windows 下文件系统事件常常早于写入者关闭文件：拿到时间戳也可能读到半截，
+                    // 所以这里既比时间戳、也给读取留退避重试（同 PolicyStore.ReadDiskEnvelope 的教训）。
+                    DateTime stamp = StampOfDisk();
+                    if (stamp == _diskStampUtc) return false;
+                    List<DeviceGroup> loaded = ReadFromDiskWithRetry();
+                    if (loaded == null) return false;
+                    Groups = loaded;
+                    _diskStampUtc = stamp;
+                    Log.Info("已拾取磁盘上的分组文件：" + Groups.Count + " 组");
+                    return true;
                 }
+                catch (Exception ex)
+                {
+                    Log.Warn("拾取分组文件失败（保留现行分组）：" + ex.Message);
+                    return false;
+                }
+            }
+        }
+
+        private DateTime StampOfDisk()
+        {
+            try { return File.Exists(GroupsPath) ? File.GetLastWriteTimeUtc(GroupsPath) : DateTime.MinValue; }
+            catch { return DateTime.MinValue; }
+        }
+
+        private string ReadDiskText()
+        {
+            for (int attempt = 0; attempt < 25; attempt++)
+            {
+                try
+                {
+                    using (var fs = new FileStream(GroupsPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                    using (var sr = new StreamReader(fs, Encoding.UTF8))
+                        return sr.ReadToEnd();
+                }
+                catch (FileNotFoundException) { return null; }
+                catch (DirectoryNotFoundException) { return null; }
+                catch (IOException) { System.Threading.Thread.Sleep(80); }
+            }
+            return null;
+        }
+
+        private List<DeviceGroup> ReadFromDiskWithRetry()
+        {
+            string text = ReadDiskText();
+            if (text == null) return null;
+            return ParseGroups(text);
+        }
+
+        private List<DeviceGroup> ReadFromDisk()
+        {
+            var list = new List<DeviceGroup>();
+            try
+            {
+                if (!File.Exists(GroupsPath)) return list;
+                string text = ReadDiskText();
+                if (text == null) { Log.Warn("分组文件在约 2 秒内一直不可读，按空分组处理"); return list; }
+                return ParseGroups(text);
             }
             catch (Exception ex)
             {
                 Log.Warn("读取分组文件失败（按空分组处理）：" + ex.Message);
-                Groups = new List<DeviceGroup>();
+                return list;
             }
+        }
+
+        private static List<DeviceGroup> ParseGroups(string text)
+        {
+            var list = new List<DeviceGroup>();
+            var doc = new JavaScriptSerializer { MaxJsonLength = 8 * 1024 * 1024 }
+                .Deserialize<Dictionary<string, object>>(text);
+            if (doc == null) return list;
+            int schema = doc.TryGetValue("schemaVersion", out object sv) && sv is IConvertible ? Convert.ToInt32(sv) : 0;
+            if (schema != 1) { Log.Warn("分组文件 schemaVersion 不认识（" + schema + "），按空分组处理"); return list; }
+            if (!(doc.TryGetValue("groups", out object groupsObj) && groupsObj is System.Collections.IEnumerable en)) return list;
+            foreach (object o in en)
+            {
+                var m = o as Dictionary<string, object>;
+                if (m == null) continue;
+                var g = new DeviceGroup
+                {
+                    Id = Str(m, "id"),
+                    Name = Str(m, "name"),
+                    Envelope = Str(m, "envelope"),
+                    IssuedAtUtc = Str(m, "issuedAtUtc"),
+                    Paused = Bool(m, "paused"),
+                    Seq = Ulong(m, "seq"),
+                };
+                if (string.IsNullOrEmpty(g.Id) || string.IsNullOrEmpty(g.Name)) continue;
+                g.DeviceIds = StrList(m, "deviceIds");
+                g.Machines = StrList(m, "machines");
+                list.Add(g);
+            }
+            return list;
         }
 
         public void Save()
@@ -100,6 +225,7 @@ namespace LabGuardServer.Core.Policy
                         }).ToList() },
                 };
                 AtomicFile.WriteAllText(GroupsPath, new JavaScriptSerializer().Serialize(doc));
+                _diskStampUtc = StampOfDisk();     // 记下自己这次写的时间戳：免得马上又被自己的写入触发一次重载
             }
             catch (Exception ex)
             {

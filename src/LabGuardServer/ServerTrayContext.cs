@@ -52,6 +52,7 @@ namespace LabGuardServer
             _store = new PolicyStore(Program.DataDir, _keys);
             _groups = new GroupStore(Program.DataDir);
             _groups.Load();
+            _groups.StartWatching();   // 外部（CLI/脚本/无人值守）改的分组也要能被拾取
             try
             {
                 _store.Load();
