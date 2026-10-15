@@ -662,6 +662,11 @@ namespace LabGuardServer
             if (changes.Count > 12) bodyText += Environment.NewLine + "…还有 " + (changes.Count - 12) + " 项";
             if (changes.Any(c => c.Dangerous))
                 bodyText += Environment.NewLine + Environment.NewLine + "⚠ 其中包含【危险】项，请再确认一次。";
+            // 「开了但不会生效」提示（2026-10-15 客户端出厂全关后新增）：
+            // 最容易踩的是"只点开子开关、忘了打开那一组的总闸"——在这里说清楚，别等老师到教室才发现。
+            List<string> gateWarn = PolicyGate.Warnings(changes, _policy);
+            if (gateWarn.Count > 0)
+                bodyText += Environment.NewLine + Environment.NewLine + string.Join(Environment.NewLine, gateWarn);
             // 执行计划 §F4：预览里要能看到"临时覆盖是否存在及预计结束时间"
             if (_temp != null && _temp.Active)
                 bodyText += Environment.NewLine + Environment.NewLine +

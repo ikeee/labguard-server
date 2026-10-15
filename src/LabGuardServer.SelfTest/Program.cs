@@ -369,15 +369,42 @@ namespace LabGuardServer.SelfTest
                 var newPolicy = Json.ParseObject(catalog.DefaultPolicyJson);
                 Check(PolicyDiff.Compare(oldPolicy, newPolicy, fields).Count == 0, "7.7 两份相同策略 → 差异 0 条");
                 PathAccess.Set(newPolicy, "Network.DnsServers", new[] { "10.28.1.10" });
-                PathAccess.Set(newPolicy, "Classroom.Enabled", false);
+                // 注意：0.15.0 起客户端出厂口径是**全关**，所以"改一项布尔"要把默认的 false 改成 true
+                PathAccess.Set(newPolicy, "Classroom.Enabled", true);
                 List<PolicyChange> changes = PolicyDiff.Compare(oldPolicy, newPolicy, fields);
                 Check(changes.Count == 2, "7.8 改两项 → 差异 2 条", changes.Count + " 条");
-                Check(changes.Any(c => c.Path == "Classroom.Enabled" && c.NewText == "关"),
+                Check(changes.Any(c => c.Path == "Classroom.Enabled" && c.NewText == "开"),
                     "7.9 布尔值以「开/关」呈现给老师看");
                 Check(changes.Any(c => c.Path == "Network.DnsServers" && c.NewText.Contains("10.28.1.10")),
                     "7.10 列表值以顿号连接呈现");
                 Check(PolicyDiff.Format(null) == "（空）" && PolicyDiff.Format(true) == "开" &&
                       PolicyDiff.Format(false) == "关", "7.11 空值/布尔格式化");
+
+                // ---- 「开了但不会生效」检查（2026-10-15 客户端出厂全关之后新增）
+                // 全关之后最容易踩的坑：只点开一个子开关，忘了打开它那一组的总闸 → 面板看着开了、机器上没反应。
+                var gateBase = Json.ParseObject(catalog.DefaultPolicyJson);
+                var gatePolicy = Json.ParseObject(catalog.DefaultPolicyJson);
+                // 注意用「禁远程桌面接入」这项：它出厂是关的，改成开才算"这次打开了一项"。
+                // （组内子项的默认值仍然保留，例如「禁快速切换用户」出厂就是 true —— 拿它当"打开"会是个空改动。）
+                PathAccess.Set(gatePolicy, "Session.DenyRemoteDesktop", true);         // 只开子项，总闸仍是关
+                var w1 = PolicyGate.Warnings(PolicyDiff.Compare(gateBase, gatePolicy, fields), gatePolicy);
+                Check(w1.Any(x => x.Contains("Session.Enabled")),
+                    "7.14 只开子开关、没开组总闸 → 提示「不会生效」", w1.Count + " 条");
+
+                PathAccess.Set(gatePolicy, "Session.Enabled", true);                  // 再把总闸打开
+                var w2 = PolicyGate.Warnings(PolicyDiff.Compare(gateBase, gatePolicy, fields), gatePolicy);
+                Check(w2.Count == 0, "7.15 打开组总闸后 → 不再提示（提示不能变成噪音）", w2.Count + " 条");
+
+                // Hosts 是"或"语义（Hosts.Enabled || Hosts.ProtectFileAcl）：单独打开只读加固是**有效**的 → 不许误报
+                var hostPolicy = Json.ParseObject(catalog.DefaultPolicyJson);
+                PathAccess.Set(hostPolicy, "Hosts.ProtectFileAcl", true);
+                Check(PolicyGate.Warnings(PolicyDiff.Compare(gateBase, hostPolicy, fields), hostPolicy).Count == 0,
+                    "7.16 Hosts 只读加固单独打开是有效的 → 不误报（或语义的分组不进总闸表）");
+
+                var offPolicy = Json.ParseObject(catalog.DefaultPolicyJson);
+                PathAccess.Set(offPolicy, "Enabled", false);
+                Check(PolicyGate.Warnings(new List<PolicyChange>(), offPolicy).Any(x => x.Contains("总闸")),
+                    "7.17 总闸（0、总体）关着 → 明确提示「所有策略都不会生效」");
 
                 // ---- 职责归属（2026-10-12 定稿）：服务端不执行管控，只下发；面板按"谁执行"分三层
                 List<string> sections = catalog.Sections();

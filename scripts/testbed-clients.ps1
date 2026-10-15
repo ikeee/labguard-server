@@ -274,6 +274,24 @@ function Ledger([string]$wn, [string]$ev, [string]$act, [int]$mac, [string]$took
     [void]$classLedger.Add([pscustomobject]@{ when = $wn; event = $ev; action = $act; machines = $mac; took = $took })
 }
 
+function Wait-LogContains([string]$needle, [int]$timeoutSec = 45) {
+    # 等某个"执行层"的干跑写入出现在学生机日志里（client-out.log 是控制台输出，纯 ASCII 字段不受编码影响）。
+    # 为什么要等：课堂预设里的 StartDelaySeconds=41xx/42xx/43xx 是**标记值**，副作用是引擎在那一步不启动，
+    # 所以"开关真的走到执行层"往往要等到后面某次下发把引擎拉起来才看得到。
+    # 以前这条检查是**碰巧通过**的：客户端出厂默认把「防会话逃逸」开着，从开机起就在写这行日志；
+    # 0.15.0 起出厂全关，靠默认值撑着的断言必须改成显式等待（否则就是"测了个空气"）。
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        foreach ($d in $clientDirs) {
+            $lg = Join-Path $d 'client-out.log'
+            if ((Test-Path -LiteralPath $lg) -and
+                (Get-Content -LiteralPath $lg -Raw -Encoding UTF8).Contains($needle)) { return $true }
+        }
+        Start-Sleep -Milliseconds 300
+    }
+    return $false
+}
+
 # 老师的"一键预设"= 机房自己的 temp-presets.json（托盘菜单里就是这么列出来的）
 $presets = @'
 {"schemaVersion":1,"presets":[
@@ -331,14 +349,8 @@ foreach ($d in $clientDirs) {
 Check ('课堂③ 桌面/会话防逃开关全班到位（' + [math]::Round($took, 1) + 's）：BlockWindowsKey + HideTaskView + BlockVirtualDesktop + BlockFastUserSwitch') `
     (($took -ge 0) -and $okEscape)
 # 学生机上真的走到执行层了吗？（沙箱是干跑：日志里应是 [dry] SET-REG；"禁快速切换用户"写的是 HKLM 机器级位置）
-$escapeDry = $false
-foreach ($d in $clientDirs) {
-    $lg = Join-Path $d 'client-out.log'
-    if (Test-Path -LiteralPath $lg) {
-        if ((Get-Content -LiteralPath $lg -Raw -Encoding UTF8).Contains('Policies\System\HideFastUserSwitching = 1')) { $escapeDry = $true }
-    }
-}
-Check '课堂③ 学生机日志里出现 [dry] 写「禁快速切换用户」（证明开关真的走到了执行层）' $escapeDry
+# 注意：这一步**不在这里断言** —— 课堂预设用的 43xx 标记值会让引擎在这一步不启动（见 Wait-LogContains 的注释），
+# 所以放在整节课跑完之后统一核对（那时候引擎已经起来过，执行层日志一定留下了）。
 Ledger '00:15' '多开桌面逃管制' '点 1 下：课堂严管+桌面防逃' $Clients ([math]::Round($took, 1).ToString() + 's')
 
 # ---- ④ 个别人继续破坏电脑：只处理他，不牵连全班（分组 + 临时层自动重算）
@@ -402,6 +414,10 @@ while ((Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 300
 }
 Check '课堂⑥ 老师没点结束 → 到点**自动**回基础策略（不需要老师记得）' $autoBack
+
+# ---- ③ 的执行层确认（放到这里核对，理由见上面那段注释）
+$escapeDry = Wait-LogContains 'Policies\System\HideFastUserSwitching = 1' 45
+Check '课堂③ 执行层确认：学生机日志里出现 [dry] 写「禁快速切换用户」（开关真的走到了执行层）' $escapeDry
 Ledger '00:45' '老师忘点结束' '不需要动作：到点自动恢复' $Clients '自动'
 
 Say ''
