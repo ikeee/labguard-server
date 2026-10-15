@@ -16,6 +16,7 @@ namespace LabGuardServer
     {
         private RsaKeyStore _keys;
         private PolicyStore _store;
+        private PinnedStore _pinned;        // 常驻（固化锁）
         private ApiServer _api;
         private CatalogDoc _catalog;
         private NotifyIcon _tray;
@@ -60,6 +61,8 @@ namespace LabGuardServer
             }
 
             _store = new PolicyStore(Program.DataDir, _keys);
+            _pinned = new PinnedStore(Program.DataDir);     // 常驻（固化锁）：老师勾了"常驻"的项，谁也动不了
+            _store.Pinned = _pinned;
             _groups = new GroupStore(Program.DataDir);
             _groups.Load();
             _groups.StartWatching();   // 外部（CLI/脚本/无人值守）改的分组也要能被拾取
@@ -87,7 +90,7 @@ namespace LabGuardServer
                     "首次部署：生成了新的签名密钥（公钥指纹 " + _keys.Fingerprint + "）");
 
             // v0.12 临时课堂状态层：启动即装载（已过期的会被丢弃并把基础策略重发一次）
-            _temp = new TempStateManager(Program.DataDir, _keys, _store, _groups);
+            _temp = new TempStateManager(Program.DataDir, _keys, _store, _groups, _pinned);
             _temp.Auditor = _audit;
             _temp.Load(DateTime.UtcNow);
             _temp.StartWatching();
@@ -215,7 +218,7 @@ namespace LabGuardServer
                 if (oldEnv.Verified) oldGroupPolicy = Json.ParseObject(oldEnv.PolicyJson);
             }
             ulong seq = GroupPublisher.Publish(_keys, group, policy, paused,
-                () => _store.RefreshWatermark(), s => _store.MarkPublished(s));
+                () => _store.RefreshWatermark(), s => _store.MarkPublished(s), _pinned);
             _groups.Save();
             // 分组策略变了 → 若正在临时状态中，按新基础重算临时信封（否则临时层停在旧基础上）
             _temp?.RefreshIfActive("分组策略更新：" + group.Name);

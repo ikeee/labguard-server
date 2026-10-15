@@ -33,6 +33,12 @@ namespace LabGuardServer.Core.Policy
         private readonly RsaKeyStore _keys;
 
         /// <summary>
+        /// 常驻（固化锁）列表。**默认组（全部设备）是唯一能改锁值的地方**：
+        /// 在这里保存时，"锁着的项如果被老师改了值" → 就地更新锁值；其余策略保存/合成一律只把锁值盖回去。
+        /// </summary>
+        public PinnedStore Pinned { get; set; }
+
+        /// <summary>
         /// **全局分配水位**：所有组（含默认组）共享的"已发布过的最大 seq"。
         /// 它是"绝不重复使用同一个 seq"的保证——两个进程/两个组同时发布也不会撞号。
         /// 存于 <c>seq.highwater</c> 的 <c>seq</c> 字段。
@@ -100,13 +106,29 @@ namespace LabGuardServer.Core.Policy
             string json;
             if (policy != null)
             {
-                json = Json.Stringify(policy);
+                Dictionary<string, object> effective = policy;
+                if (Pinned != null)
+                {
+                    // ① 老师显式改了锁着的项 → 更新锁值（这是锁值能变的唯一入口之一）
+                    List<string> changed = Pinned.UpdateFromExplicit(policy);
+                    if (changed.Count > 0)
+                        Log.Info("常驻项被老师显式修改，锁值已更新：" + string.Join("、", changed));
+                    // ② 其余锁着的项：把锁值盖回去（老师这次没动它们，就不许被别的东西改掉）
+                    effective = Pinned.ApplyTo(policy);
+                }
+                json = Json.Stringify(effective);
             }
             else
             {
                 // policy == null：按目录默认值重置（第一次保存 / 「恢复默认」按钮）
                 if (string.IsNullOrEmpty(defaultPolicyJsonForReset))
                     throw new ArgumentNullException(nameof(defaultPolicyJsonForReset));
+                // 「恢复默认」= 连常驻锁定一起清掉（否则"我明明恢复了默认，怎么这几项还是锁着的"更让人困惑）
+                if (Pinned != null)
+                {
+                    int n = Pinned.Clear();
+                    if (n > 0) Log.Warn("「恢复默认」已清空 " + n + " 项常驻锁定（要重新锁就再勾一次「常驻」）");
+                }
                 json = defaultPolicyJsonForReset;
             }
             // 先跟磁盘对一次全局水位：**另一个进程**可能刚发布过（CLI/脚本/管理端），

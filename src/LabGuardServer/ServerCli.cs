@@ -96,6 +96,8 @@ namespace LabGuardServer
             groups.StartWatching();                    // 别人（GUI/另一个脚本进程）改的分组也要拾取
             var room = RoomConfig.Load(dataDir);       // v0.14 本机房信息（教室名 + 期望 IP 段，用来查越界设备）
             var store = new PolicyStore(dataDir, keys);
+            var pinned = new PinnedStore(dataDir);     // 常驻（固化锁）：CLI 与 GUI 共用同一份 pinned.json
+            store.Pinned = pinned;
             try { store.Load(); store.StartWatching(); }
             catch (Exception ex)
             {
@@ -107,7 +109,7 @@ namespace LabGuardServer
                               (store.CurrentEnvelope == null ? "（尚未配置）" : "") + "  水位=" + store.Watermark);
 
             // 临时课堂状态层（v0.12）：启动即装载；**已过期的直接丢弃并重发基础策略**（不允许"睡一觉还在考试模式"）
-            var temp = new TempStateManager(dataDir, keys, store, groups);
+            var temp = new TempStateManager(dataDir, keys, store, groups, pinned);
             temp.Auditor = audit;
             temp.Load(DateTime.UtcNow);
             temp.StartWatching();      // 别的进程（GUI/另一个脚本）开的临时状态也要拾取
@@ -208,7 +210,7 @@ namespace LabGuardServer
                     if (oldEnv.Verified) oldGroupPolicy = Json.ParseObject(oldEnv.PolicyJson);
                 }
                 // 水位读数用 RefreshWatermark()：先跟磁盘对齐再分配（多进程同时发布也不会撞号）
-                ulong seq = GroupPublisher.Publish(keys, g, gp, false, () => store.RefreshWatermark(), s => store.MarkPublished(s));
+                ulong seq = GroupPublisher.Publish(keys, g, gp, false, () => store.RefreshWatermark(), s => store.MarkPublished(s), pinned);
                 output.WriteLine("已下发到组【" + g.Name + "】：seq=" + seq + "（成员 " + (g.DeviceIds.Count + g.Machines.Count) + "）");
                 groupsDirty = true;
                 audit.Write(AuditAction.PolicyPublish, "group", g.Name, prevSeq, seq, "ok", null,

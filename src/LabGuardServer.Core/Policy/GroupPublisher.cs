@@ -18,15 +18,19 @@ namespace LabGuardServer.Core.Policy
     public static class GroupPublisher
     {
         /// <summary>发布某组策略，返回新的 seq。水位读写由调用方接进 PolicyStore 的全局水位。</summary>
+        /// <param name="pinned">
+        /// 常驻（固化锁）：发布组策略时把锁值**盖回去** —— 组策略改不动常驻项（这是老师的口径：
+        /// "勾了常驻，分组切换也不许动它"）。可以传 null（自检/老调用）。
+        /// </param>
         public static ulong Publish(RsaKeyStore keys, DeviceGroup group, Dictionary<string, object> policy, bool paused,
-            Func<ulong> watermarkReader, Action<ulong> watermarkWriter)
+            Func<ulong> watermarkReader, Action<ulong> watermarkWriter, PinnedStore pinned = null)
         {
             if (keys == null) throw new ArgumentNullException(nameof(keys));
             if (group == null) throw new ArgumentNullException(nameof(group));
             if (policy == null) throw new ArgumentNullException(nameof(policy));
             ulong watermark = watermarkReader != null ? watermarkReader() : 0;
             ulong seq = Math.Max(watermark, group.Seq) + 1;
-            string json = Json.Stringify(policy);
+            string json = Json.Stringify(pinned != null ? pinned.ApplyTo(policy) : policy);
             string envelope = PolicyEnvelope.Build(seq, DateTime.UtcNow, paused, json, keys.Rsa);
             group.Envelope = envelope;
             group.Seq = seq;

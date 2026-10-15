@@ -61,6 +61,7 @@ namespace LabGuardServer
 
         private Dictionary<string, object> _policy;
         private Dictionary<string, object> _published;
+        private bool _pinsDirty;      // 只改了「常驻」勾选（没改值）也算"有未下发改动"
         private readonly List<Binding> _bindings = new List<Binding>();
 
         private sealed class Binding
@@ -68,6 +69,8 @@ namespace LabGuardServer
             public CatalogField Field;
             public Control Input;
             public Panel Strip;
+            public CheckBox Pin;          // 「常驻」勾选（固化锁，见 PinnedStore）
+            public Label State;           // 拨钮旁边那行"开/关"（扫一眼就懂，不用去数拨钮偏哪边）
         }
 
         public PolicyForm(PolicyStore store, CatalogDoc catalog, ApiServer api = null,
@@ -357,6 +360,26 @@ namespace LabGuardServer
             Control input = BuildInput(f);
             card.Controls.Add(input);
 
+            // 「常驻」（2026-10-15 老师的设计：每个策略两个控件 = 开关 + 常驻）：
+            // 勾了 = 这一项**锁死**：临时课堂状态 / 分组策略 / 下课回滚都不许动它（见 PinnedStore）。
+            // 锁是"全班一把"——所以只在「全部设备（默认策略）」这个目标下能勾；在组视图里显示状态但不可改。
+            Label state = null;
+            if (input is ToggleSwitch toggle)
+            {
+                state = new Label
+                {
+                    Text = toggle.Checked ? "开" : "关", AutoSize = true, Location = new Point(input.Right + 8, input.Top + 3),
+                    ForeColor = toggle.Checked ? Color.FromArgb(0, 110, 190) : Color.Gray,
+                };
+                toggle.CheckedChanged += (s, e) =>
+                {
+                    state.Text = toggle.Checked ? "开" : "关";
+                    state.ForeColor = toggle.Checked ? Color.FromArgb(0, 110, 190) : Color.Gray;
+                };
+                card.Controls.Add(state);
+            }
+
+            CheckBox pin = null;
             int bottom = input.Bottom;
             if (!string.IsNullOrEmpty(f.Hint))
             {
@@ -368,8 +391,27 @@ namespace LabGuardServer
                 card.Controls.Add(hint);
                 bottom = hint.Bottom;
             }
+
+            // 「常驻」放在整张卡片的最下面（说明文字之后），免得压住 hint
+            if (_store != null && _store.Pinned != null)
+            {
+                bool onDefaultTarget = CurrentTargetKey() == null;
+                pin = new CheckBox
+                {
+                    Text = onDefaultTarget
+                        ? "常驻：锁死这一项（临时课堂状态 / 分组切换 / 下课回滚都动不了它）"
+                        : "常驻（在「全部设备」里设置；这里只显示状态）",
+                    AutoSize = true, Checked = _store.Pinned.IsPinned(f.Path),
+                    Enabled = onDefaultTarget,
+                    ForeColor = onDefaultTarget ? Color.FromArgb(70, 76, 84) : Color.Gray,
+                    Location = new Point(18, bottom + 6),
+                };
+                pin.CheckedChanged += (s, e) => { _pinsDirty = true; UpdateChangedUi(false); };
+                card.Controls.Add(pin);
+                bottom = pin.Bottom;
+            }
             card.Height = bottom + 18;
-            _bindings.Add(new Binding { Field = f, Input = input, Strip = strip });
+            _bindings.Add(new Binding { Field = f, Input = input, Strip = strip, Pin = pin, State = state });
             return card;
         }
 
@@ -380,9 +422,10 @@ namespace LabGuardServer
             switch (f.Kind)
             {
                 case CatalogFieldKind.Bool:
-                    var chk = new CheckBox { AutoSize = true, Checked = current is bool b && b, Text = "启用" };
-                    chk.CheckedChanged += (s, e) => OnValueChanged();
-                    input = chk;
+                    // 拨钮开关（老师的设计：拨向左 = 关，拨向右 = 开）。100+ 项时"扫一眼"就靠它。
+                    var toggle = new ToggleSwitch { Checked = current is bool b && b };
+                    toggle.CheckedChanged += (s, e) => OnValueChanged();
+                    input = toggle;
                     break;
                 case CatalogFieldKind.Choice:
                     var combo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 380 };
@@ -443,10 +486,14 @@ namespace LabGuardServer
             {
                 bool isChanged = !PolicySearch.SameValue(PathAccess.Get(_policy, b.Field.Path),
                     PathAccess.Get(_published, b.Field.Path));
+                // 「常驻」勾选的变化也算"未下发的改动"（它不是值，但同样要保存下发才生效）
+                if (b.Pin != null && _store != null && _store.Pinned != null &&
+                    b.Pin.Checked != _store.Pinned.IsPinned(b.Field.Path))
+                    isChanged = true;
                 if (isChanged) changed++;
                 b.Strip.BackColor = isChanged ? StripChanged : (b.Field.Dangerous ? StripDanger : StripNormal);
             }
-            _changedLabel.Text = changed == 0 ? "未改动" : ("已改动 " + changed + " 项");
+            _changedLabel.Text = changed == 0 ? "未改动" : ("已改动 " + changed + " 项" + (_pinsDirty ? "（含常驻）" : ""));
             _changedLabel.ForeColor = changed == 0 ? Color.DimGray : Color.FromArgb(0, 90, 170);
             if (refreshTree) RebuildTree();
         }
@@ -458,7 +505,9 @@ namespace LabGuardServer
                 object value;
                 switch (b.Field.Kind)
                 {
-                    case CatalogFieldKind.Bool: value = ((CheckBox)b.Input).Checked; break;
+                    case CatalogFieldKind.Bool:
+                        value = (b.Input is ToggleSwitch) ? ((ToggleSwitch)b.Input).Checked : ((CheckBox)b.Input).Checked;
+                        break;
                     case CatalogFieldKind.Choice:
                         var combo = (ComboBox)b.Input;
                         value = b.Field.Values[combo.SelectedIndex >= 0 ? combo.SelectedIndex : 0];
@@ -610,6 +659,7 @@ namespace LabGuardServer
             FlushBindings();
             DeviceGroup target = TargetGroup();
             if (!ShowDiff(false)) return;
+            ApplyPinEdits();          // 老师在确认框里点了"确定"之后，才动固化锁
             try
             {
                 if (target != null)
@@ -645,6 +695,44 @@ namespace LabGuardServer
             }
         }
 
+        /// <summary>
+        /// 把面板上的「常驻」勾选落到固化锁上（**只有「全部设备（默认策略）」这个目标允许改锁**）。
+        ///
+        /// 注意分工：**锁值的更新**（老师改了锁着的项的值）由 <see cref="PolicyStore.Save"/> 负责，
+        /// 这里只管"勾上/取消"这件事本身。两者顺序无关，都是幂等的。
+        /// </summary>
+        private void ApplyPinEdits()
+        {
+            PinnedStore pinned = _store?.Pinned;
+            if (pinned == null) return;
+            if (CurrentTargetKey() != null) return;      // 组视图里常驻是只读的（锁是全班一把）
+            foreach (Binding b in _bindings)
+            {
+                if (b.Pin == null) continue;
+                if (b.Pin.Checked && !pinned.IsPinned(b.Field.Path))
+                    pinned.Pin(b.Field.Path, PathAccess.Get(_policy, b.Field.Path));
+                else if (!b.Pin.Checked && pinned.IsPinned(b.Field.Path))
+                    pinned.Unpin(b.Field.Path);
+            }
+            _pinsDirty = false;
+        }
+
+        /// <summary>面板上"常驻勾选"与当前锁状态的差异（给确认框显示，不改任何东西）。</summary>
+        private List<string> PinEdits()
+        {
+            var list = new List<string>();
+            PinnedStore pinned = _store?.Pinned;
+            if (pinned == null || CurrentTargetKey() != null) return list;
+            foreach (Binding b in _bindings)
+            {
+                if (b.Pin == null) continue;
+                bool now = pinned.IsPinned(b.Field.Path);
+                if (b.Pin.Checked == now) continue;
+                list.Add((b.Pin.Checked ? "锁定" : "解锁") + "【" + b.Field.Section + "】" + b.Field.Label);
+            }
+            return list;
+        }
+
         private bool ShowDiff(bool previewOnly)
         {
             List<PolicyChange> changes = PolicyDiff.Compare(_published, _policy, _catalog.Fields);
@@ -667,6 +755,15 @@ namespace LabGuardServer
             List<string> gateWarn = PolicyGate.Warnings(changes, _policy);
             if (gateWarn.Count > 0)
                 bodyText += Environment.NewLine + Environment.NewLine + string.Join(Environment.NewLine, gateWarn);
+            // 「常驻」的勾选变化也要让老师在确认框里看见（它不是值，但同样要保存才生效）
+            List<string> pinEdits = PinEdits();
+            if (pinEdits.Count > 0)
+            {
+                bodyText += Environment.NewLine + Environment.NewLine +
+                            "★ 常驻改动 " + pinEdits.Count + " 项：\n· " +
+                            string.Join("\n· ", pinEdits.Take(8)) +
+                            (pinEdits.Count > 8 ? "\n…还有 " + (pinEdits.Count - 8) + " 项" : "");
+            }
             // 执行计划 §F4：预览里要能看到"临时覆盖是否存在及预计结束时间"
             if (_temp != null && _temp.Active)
                 bodyText += Environment.NewLine + Environment.NewLine +

@@ -411,6 +411,13 @@ namespace LabGuardServer.SelfTest
                 var unclassified = PolicyOwnership.UnclassifiedSections(sections);
                 Check(unclassified.Count == 0, "7.12 客户端目录里每个分组都被归属表覆盖",
                     string.Join("；", unclassified));
+                // 分类顺序（2026-10-15 修）：必须按序号前缀排，不能按 catalog.json 的出现顺序
+                // （后者会让后加的「16、防会话逃逸」跑到 9 和 10 之间 → 面板上 0..9 → 16 → 10..15）
+                int i16 = sections.IndexOf(sections.FirstOrDefault(s => s.StartsWith("16、", StringComparison.Ordinal)));
+                int i15 = sections.IndexOf(sections.FirstOrDefault(s => s.StartsWith("15、", StringComparison.Ordinal)));
+                int i9 = sections.IndexOf(sections.FirstOrDefault(s => s.StartsWith("9、", StringComparison.Ordinal)));
+                Check(i9 >= 0 && i15 > i9 && i16 > i15 && sections[0].StartsWith("0、", StringComparison.Ordinal),
+                    "7.12b 分类按序号排（0 → 9 → 15 → 16），不是按 catalog 里的出现顺序", string.Join(" / ", sections));
                 var unmatched = PolicyOwnership.UnmatchedPrefixes(sections);
                 Check(unmatched.Count == 0, "7.13 归属表里每个前缀都能对上目录分组（改名不会静默失效）",
                     string.Join("；", unmatched));
@@ -1021,6 +1028,84 @@ namespace LabGuardServer.SelfTest
                         "14.7 本机房信息落盘/读回：A202 认自己的 42，把 A203 的 150 判为越界");
                     Check(RoomConfig.Load(Path.Combine(tmp, "no-such-room")).Ranges.Count == 0,
                         "14.8 没配本机房信息也能正常跑（不配 = 不做越界判定）");
+
+                    // ============================================================ [15] 常驻（固化锁）
+                    // 老师的设计（2026-10-15）：每个策略两个控件 —— 拨钮开关 + 「常驻」。
+                    // 口径（老师原话）：**勾了常驻，任何"临时课堂状态 / 分组切换 / 下课回滚"都不许动它**。
+                    Console.WriteLine("[15] 常驻（固化锁）：临时课堂状态 / 分组切换 / 下课回滚都不许动它");
+                    string pdir = Path.Combine(tmp, "pinned");
+                    Directory.CreateDirectory(pdir);
+                    var pinned = new PinnedStore(pdir);
+                    Check(pinned.Count == 0 && !pinned.IsPinned("Usb.Enabled"), "15.1 初始没有任何锁定项");
+                    Check(pinned.ApplyTo(null) == null && pinned.UpdateFromExplicit(null).Count == 0,
+                        "15.1 空输入不炸（策略字典为 null 时原样返回）");
+
+                    pinned.Pin("Usb.Enabled", true);
+                    pinned.Pin("Network.DnsServers", new[] { "10.0.0.10" });
+                    Check(pinned.IsPinned("Usb.Enabled") && pinned.Count == 2 && File.Exists(pinned.FilePath),
+                        "15.2 勾常驻 → 锁值落盘（pinned.json）");
+                    Check(new PinnedStore(pdir).IsPinned("Usb.Enabled"),
+                        "15.2 重启进程（新实例）也读得回来 —— 否则重启就静默放开锁");
+
+                    // 15.3 ApplyTo：不改入参 + 只盖"这份策略里真的有这个路径"的项
+                    var origPolicy = Json.ParseObject("{\"Usb\":{\"Enabled\":false},\"Browser\":{\"Enabled\":true}}");
+                    Dictionary<string, object> overlaid = pinned.ApplyTo(origPolicy);
+                    Check(Equals(PathAccess.Get(origPolicy, "Usb.Enabled"), false) &&
+                          Equals(PathAccess.Get(overlaid, "Usb.Enabled"), true),
+                        "15.3 ApplyTo 把锁值盖回去，**且不改调用方那份策略**（面板状态不被偷偷改）");
+                    Check(Equals(PathAccess.Get(overlaid, "Browser.Enabled"), true) &&
+                          PathAccess.Get(overlaid, "Network") == null,
+                        "15.3 只覆盖策略里存在的路径（不会凭空造出 Network 这棵子树）");
+
+                    // 15.4 真跑一遍"临时课堂状态"：锁着的项不许被临时覆盖改掉
+                    string cdir = Path.Combine(tmp, "pinned2");
+                    Directory.CreateDirectory(cdir);
+                    var cStore = new PolicyStore(cdir, keys);
+                    var cPinned = new PinnedStore(cdir);
+                    cStore.Pinned = cPinned;
+                    var cGroups = new GroupStore(cdir);
+                    cGroups.Load();
+                    var baseP = Json.ParseObject(catalog.DefaultPolicyJson);
+                    PathAccess.Set(baseP, "Usb.Enabled", true);          // 老师把"USB 禁存储"打开并锁住
+                    cPinned.Pin("Usb.Enabled", true);
+                    cStore.Save(baseP, false, catalog.DefaultPolicyJson);
+
+                    var cTemp = new TempStateManager(cdir, keys, cStore, cGroups, cPinned);
+                    cTemp.Load(DateTime.UtcNow);
+                    TempState pt = cTemp.Start("课堂严管", "{\"Usb\":{\"Enabled\":false,\"AllowStorage\":true}}",
+                        false, null, "自检", DateTime.UtcNow);
+                    var pEnv = PolicyEnvelope.Parse(pt.DefaultEnvelope, keys.Rsa);
+                    var pJson = Json.ParseObject(pEnv.PolicyJson);
+                    Check(pEnv.Verified && Equals(PathAccess.Get(pJson, "Usb.Enabled"), true) &&
+                          Equals(PathAccess.Get(pJson, "Usb.AllowStorage"), true),
+                        "15.4 临时课堂状态**动不了常驻项**（Usb.Enabled 仍是锁住的 true；没锁的 AllowStorage 照旧被临时层改掉）");
+
+                    // 15.5 分组策略也动不了常驻项（"分组切换也不许动它"）
+                    DeviceGroup pg = cGroups.Add("整改组");
+                    var pinnedGrpPolicy = Json.ParseObject(catalog.DefaultPolicyJson);
+                    PathAccess.Set(pinnedGrpPolicy, "Usb.Enabled", false);      // 组里想把 USB 放开
+                    PathAccess.Set(pinnedGrpPolicy, "StartDelaySeconds", 4321);
+                    GroupPublisher.Publish(keys, pg, pinnedGrpPolicy, false, () => cStore.RefreshWatermark(),
+                        s => cStore.MarkPublished(s), cPinned);
+                    var gEnv = PolicyEnvelope.Parse(pg.Envelope, keys.Rsa);
+                    var gJson = Json.ParseObject(gEnv.PolicyJson);
+                    Check(Equals(PathAccess.Get(gJson, "Usb.Enabled"), true) &&
+                          Convert.ToInt32(PathAccess.Get(gJson, "StartDelaySeconds")) == 4321,
+                        "15.5 分组策略**动不了常驻项**（USB 仍是锁住的 true），其余项照常按组生效");
+
+                    // 15.6 唯一能改锁值的一条路：老师在「全部设备」里显式改它并保存
+                    var edited = Json.ParseObject(catalog.DefaultPolicyJson);
+                    PathAccess.Set(edited, "Usb.Enabled", false);          // 老师明确改成"不锁 USB 了"
+                    cStore.Save(edited, false, catalog.DefaultPolicyJson);
+                    object lockedNow;
+                    Check(cPinned.TryGet("Usb.Enabled", out lockedNow) && Equals(lockedNow, false),
+                        "15.6 老师**在默认策略里显式改**锁着的项 → 锁值就地更新（否则这条锁就永远改不掉了）");
+
+                    // 15.7 取消勾选 → 解锁；「恢复默认」→ 清空全部锁定
+                    Check(cPinned.Unpin("Usb.Enabled") && !cPinned.IsPinned("Usb.Enabled"),
+                        "15.7 取消勾选「常驻」→ 解锁");
+                    cStore.Save(null, false, catalog.DefaultPolicyJson);    // 「恢复默认」
+                    Check(cPinned.Count == 0, "15.7 「恢复默认」把锁定一起清掉（不留『恢复了却还锁着』的困惑）");
                 }
             }
         }

@@ -48,13 +48,21 @@ namespace LabGuardServer.Core.Policy
         public string LastEndedReason { get; private set; }
         public DateTime LastEndedAtUtc { get; private set; }
 
-        public TempStateManager(string dataDir, RsaKeyStore keys, PolicyStore store, GroupStore groups)
+        /// <param name="pinned">
+        /// 常驻（固化锁）：临时课堂状态**不许动常驻项**（老师的口径："勾了常驻，临时课堂状态/分组切换/下课回滚都不许动它"）。
+        /// 可以传 null（自检/老调用）。
+        /// </param>
+        public TempStateManager(string dataDir, RsaKeyStore keys, PolicyStore store, GroupStore groups,
+            PinnedStore pinned = null)
         {
             _dataDir = dataDir;
             _keys = keys;
             _store = store;
             _groups = groups;
+            _pinned = pinned;
         }
+
+        private readonly PinnedStore _pinned;
 
         /// <summary>是否有临时覆盖在生效（= API 该用临时信封）。</summary>
         public bool Active { get { return Current != null; } }
@@ -354,6 +362,8 @@ namespace LabGuardServer.Core.Policy
         private string BuildMerged(string basePolicyJson, Dictionary<string, object> patch, bool paused, TempState t)
         {
             Dictionary<string, object> merged = PolicyMerge.Merge(Json.ParseObject(basePolicyJson), patch);
+            // 常驻（固化锁）：临时覆盖改不动锁着的项 —— 盖回锁值。
+            if (_pinned != null) merged = _pinned.ApplyTo(merged);
             ulong seq = NextSeq();
             if (seq > t.MaxSeq) t.MaxSeq = seq;
             return PolicyEnvelope.Build(seq, DateTime.UtcNow, paused, Json.Stringify(merged), _keys.Rsa);

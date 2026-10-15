@@ -103,7 +103,29 @@ namespace LabGuardServer.Core.Catalog
             return errors;
         }
 
-        public List<string> Sections() => Fields.Select(f => f.Section).Distinct().ToList();
+        /// <summary>
+        /// 分类列表。顺序按**序号前缀**排（"0、总体" → "1、电子教室保护" …），
+        /// 不按 catalog.json 的出现顺序 —— 后者会让后来插进去的「16、防会话逃逸」跑到 9 和 10 之间，
+        /// 面板上的分类就变成 0..9 → 16 → 10..15 这种"跳一下"的顺序，老师找分类要愣一下。
+        /// </summary>
+        public List<string> Sections()
+        {
+            return Fields.Select(f => f.Section).Distinct()
+                .OrderBy(SectionOrder)
+                .ThenBy(s => s, StringComparer.Ordinal)
+                .ToList();
+        }
+
+        /// <summary>取分类名前缀里的编号（"16、防会话逃逸" → 16）；没有编号的排最后。</summary>
+        private static int SectionOrder(string section)
+        {
+            if (string.IsNullOrEmpty(section)) return int.MaxValue;
+            int i = 0;
+            while (i < section.Length && char.IsDigit(section[i])) i++;
+            if (i == 0) return int.MaxValue;
+            int n;
+            return int.TryParse(section.Substring(0, i), out n) ? n : int.MaxValue;
+        }
 
         /// <summary>ArrayList / object[] / null → string[]（JavaScriptSerializer 的数组是 ArrayList）。</summary>
         private static string[] ToStringArray(object o)
